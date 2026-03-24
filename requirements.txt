@@ -1,0 +1,11 @@
+# LJP正负案例智能体 - 依赖
+# 基础运行依赖
+# python>=3.8
+numpy>=1.24.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# 后续检索扩展功能需要
+scikit-learn>=1.2.0
+tqdm>=4.65.0
+sentence-transformers>=2.2.0
