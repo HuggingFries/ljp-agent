@@ -70,9 +70,8 @@ def evaluate_model(
             "true_articles": list(true_articles_set),
         }
         
-        # 每10个打印一次进度序号
-        if (i + 1) % 10 == 0:
-            logger.info(f"Evaluated {i+1}/{total_samples} samples")
+        # 每个样本都标上序号，方便随时检查进度
+        logger.info(f"[{i+1}/{total_samples}] Processing sample...")
         
         try:
             # 判断是不是RAG模型：看predict方法参数
@@ -91,6 +90,15 @@ def evaluate_model(
             detail["predicted_charges"] = list(pred_charges)
             detail["predicted_articles"] = list(pred_articles)
             detail["predicted_judgment"] = result.predicted_judgment
+            
+            # 如果是自适应RAG，记录自适应k信息
+            if 'retrieval_info' in dir(result):
+                detail["adaptive_k"] = {
+                    "positive_k": result.retrieval_info.positive_k,
+                    "negative_k": result.retrieval_info.negative_k,
+                    "max_sim_pos": result.retrieval_info.max_sim_pos,
+                    "max_sim_neg": result.retrieval_info.max_sim_neg
+                }
             
             # 统计TP/FP/FN
             for c in pred_charges:
@@ -154,8 +162,14 @@ def load_label_mappings(data_dir: str = "data/cail2018/baseline"):
 
 def load_rag_index(
     index_dir: str = "data",
-    embedding_model_name: str = "uer/sbert-base-chinese-nli"
-) -> Tuple[EmbeddingRetriever, EmbeddingRetriever, SentenceTransformer]:
+    embedding_model_name: str = "uer/sbert-base-chinese-nli",
+    min_k: int = 1,
+    max_k: int = 5,
+    alpha: float = 1.0,
+    normalize: bool = False,
+    sim_min: float = None,
+    sim_max: float = None,
+) -> Tuple[AdaptiveRAGRetriever, SentenceTransformer]:
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     embedding_model = SentenceTransformer(embedding_model_name)
     
@@ -176,7 +190,13 @@ def load_rag_index(
         ))
     
     pos_embeddings = np.load(pos_index_path)
-    pos_retriever = EmbeddingRetriever()
+    pos_retriever = EmbeddingRetriever(
+        embedding_model=None,
+        min_k=min_k, 
+        max_k=max_k, 
+        alpha=alpha,
+        normalize=normalize
+    )
     pos_retriever.index(pos_cases, pos_embeddings)
     
     neg_cases_path = os.path.join(index_dir, "neg_cases.json")
@@ -196,13 +216,46 @@ def load_rag_index(
         ))
     
     neg_embeddings = np.load(neg_index_path)
-    neg_retriever = EmbeddingRetriever()
+    neg_retriever = EmbeddingRetriever(
+        embedding_model=None,
+        min_k=min_k, 
+        max_k=max_k, 
+        alpha=alpha,
+        normalize=normalize
+    )
     neg_retriever.index(neg_cases, neg_embeddings)
     
-    logger.info(f"Loaded positive index: {len(pos_cases)} cases")
-    logger.info(f"Loaded negative index: {len(neg_cases)} cases")
+    # 如果开启normalize，自动计算sim_min/sim_max
+    if normalize:
+        if sim_min is None or sim_max is None:
+            # 计算所有案例的top1 sim_max分布
+            pos_emb = pos_embeddings
+            neg_emb = neg_embeddings
+            all_emb = np.vstack([pos_emb, neg_emb])
+            norm = np.linalg.norm(all_emb, axis=1, keepdims=True)
+            norm_emb = all_emb / norm
+            sim_matrix = norm_emb @ norm_emb.T
+            # 计算每个案例的top1相似度
+            sim_max_list = []
+            for i in range(sim_matrix.shape[0]):
+                row = sim_matrix[i].copy()
+                row[i] = 0
+                sim_max_list.append(row.max())
+            auto_sim_min = np.min(sim_max_list)
+            auto_sim_max = np.max(sim_max_list)
+            sim_min = sim_min if sim_min is not None else auto_sim_min
+            sim_max = sim_max if sim_max is not None else auto_sim_max
+            # 设置参数
+            pos_retriever.set_normalization_params(sim_min, sim_max)
+            neg_retriever.set_normalization_params(sim_min, sim_max)
+            logger.info(f"Auto computed normalization params: sim_min={sim_min:.4f}, sim_max={sim_max:.4f}")
     
-    return pos_retriever, neg_retriever, embedding_model
+    adaptive_retriever = AdaptiveRAGRetriever(pos_retriever, neg_retriever)
+    
+    logger.info(f"Loaded positive index: {len(pos_cases)} cases (min_k={min_k}, max_k={max_k}, alpha={alpha}, normalize={normalize})")
+    logger.info(f"Loaded negative index: {len(neg_cases)} cases (min_k={min_k}, max_k={max_k}, alpha={alpha}, normalize={normalize})")
+    
+    return adaptive_retriever, embedding_model
 
 
 def main():
@@ -213,10 +266,22 @@ def main():
                        help='Number of samples to evaluate')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for sampling')
-    parser.add_argument('--k-positive', type=int, default=1,
-                       help='Number of positive examples for RAG')
-    parser.add_argument('--k-negative', type=int, default=1,
-                       help='Number of negative examples for RAG')
+    parser.add_argument('--k-positive', type=int, default=None,
+                       help='Number of positive examples for RAG (None=adaptive)')
+    parser.add_argument('--k-negative', type=int, default=None,
+                       help='Number of negative examples for RAG (None=adaptive)')
+    parser.add_argument('--min-k', type=int, default=1,
+                       help='Minimum k for adaptive retrieval')
+    parser.add_argument('--max-k', type=int, default=5,
+                       help='Maximum k for adaptive retrieval')
+    parser.add_argument('--alpha', type=float, default=1.0,
+                       help='Scaling factor for adaptive k: larger alpha = larger k')
+    parser.add_argument('--normalize', action='store_true',
+                       help='Normalize sim_max to get more uniform k distribution')
+    parser.add_argument('--sim-min', type=float, default=None,
+                       help='Minimum sim_max for normalization (auto detect if None)')
+    parser.add_argument('--sim-max', type=float, default=None,
+                       help='Maximum sim_max for normalization (auto detect if None)')
     parser.add_argument('--index-dir', type=str, default='data',
                        help='Index directory for RAG')
     parser.add_argument('--embedding-model', type=str, default='uer/sbert-base-chinese-nli',
@@ -268,19 +333,43 @@ def main():
     
     # ========== 评估 RAG ==========
     print("\n" + "="*60)
-    print("=== Evaluating RAG + Positive/Negative Examples ===")
+    if args.k_positive is None and args.k_negative is None:
+        print(f"=== Evaluating RAG + Adaptive k (min={args.min_k}, max={args.max_k}, alpha={args.alpha}, normalize={args.normalize}) ===")
+    else:
+        print("=== Evaluating RAG + Fixed k (Positive/Negative) ===")
     print("="*60)
     
-    pos_retriever, neg_retriever, embedding_model = load_rag_index(
-        args.index_dir, args.embedding_model
+    # 如果开启normalize，自动计算sim_min/sim_max
+    sim_min = args.sim_min
+    sim_max = args.sim_max
+    if args.normalize and (sim_min is None or sim_max is None):
+        # 预计算所有案例的top1 sim_max，得到范围
+        import numpy as np
+        pos_emb = np.load(os.path.join(args.index_dir, "pos_index.npy"), allow_pickle=False)
+        neg_emb = np.load(os.path.join(args.index_dir, "neg_index.npy"), allow_pickle=False)
+        all_emb = np.vstack([pos_emb, neg_emb])
+        norm = np.linalg.norm(all_emb, axis=1, keepdims=True)
+        norm_emb = all_emb / norm
+        sim_matrix = norm_emb @ norm_emb.T
+        # 计算每个案例的top1 sim_max
+        sim_max_list = []
+        for i in range(sim_matrix.shape[0]):
+            row = sim_matrix[i].copy()
+            row[i] = 0
+            sim_max_list.append(row.max())
+        sim_min = np.min(sim_max_list)
+        sim_max = np.max(sim_max_list)
+        logger.info(f"Auto computed sim_min={sim_min:.4f}, sim_max={sim_max:.4f}")
+    
+    adaptive_retriever, embedding_model = load_rag_index(
+        args.index_dir, args.embedding_model, args.min_k, args.max_k, args.alpha, args.adaptive_mode, sim_min, sim_max
     )
     
     rag_model = LJPAgentWithRAG(
         base_url=base_url,
         api_key=api_key,
         model_name=model_name,
-        pos_retriever=pos_retriever,
-        neg_retriever=neg_retriever,
+        adaptive_retriever=adaptive_retriever,
         k_positive=args.k_positive,
         k_negative=args.k_negative,
         charge_names=charge_names,
@@ -335,9 +424,29 @@ def main():
         }
     }
     
-    # 保存结果到results文件夹
+    # 保存结果到results文件夹，文件名包含配置参数方便对比
     os.makedirs("results", exist_ok=True)
-    output_file = os.path.join("results", f"comparison_baseline_rag_{args.max_samples}.json")
+    # 区分固定k和自适应k, 方便消融对比
+    if args.k_positive is None and args.k_negative is None:
+        # 全自适应
+        output_file = os.path.join(
+            "results", 
+            f"comparison_s{args.seed}_n{args.max_samples}_adaptive_min{args.min_k}_max{args.max_k}.json"
+        )
+    elif args.k_positive is not None and args.k_negative is not None:
+        # 全固定k
+        output_file = os.path.join(
+            "results", 
+            f"comparison_s{args.seed}_n{args.max_samples}_p{args.k_positive}_neg{args.k_negative}_fixed.json"
+        )
+    else:
+        # 混合：部分固定部分自适应
+        p_tag = f"p{args.k_positive}" if args.k_positive is not None else "padaptive"
+        n_tag = f"neg{args.k_negative}" if args.k_negative is not None else "negadaptive"
+        output_file = os.path.join(
+            "results", 
+            f"comparison_s{args.seed}_n{args.max_samples}_{p_tag}_{n_tag}_min{args.min_k}_max{args.max_k}.json"
+        )
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
     

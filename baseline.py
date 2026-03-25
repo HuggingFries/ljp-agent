@@ -24,7 +24,7 @@ class ZeroShotLJPBaseline:
         self,
         base_url: str,
         api_key: str,
-        model_name: str = "ark-code-latest"
+        model_name: str = "deepseek-chat"
     ):
         import os
         # 排除代理，防止SSL问题

@@ -43,43 +43,40 @@ from baseline import ZeroShotLJPBaseline
 
 def load_api_config():
     """加载API配置
-    支持DeepSeek/Volcengine等兼容OpenAI格式的API
-    优先级：环境变量 > 配置文件
-    
-    DeepSeek默认配置：
-    - DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
-    - DEEPSEEK_MODEL_ID: deepseek-chat / deepseek-coder
+    从项目根目录读取配置文件 config.json，统一管理
+    格式示例：
+    {
+      "api_key": "your-api-key",
+      "model_name": "deepseek-chat",
+      "base_url": "https://api.deepseek.com/v1"
+    }
     """
-    # 支持两种环境变量前缀，DeepSeek优先
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-    model_name = os.environ.get("DEEPSEEK_MODEL_ID", "deepseek-chat")
+    # 配置文件放在项目根目录
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
     
-    # 如果没配置DeepSeek，回退到Volcengine
-    if api_key is None:
-        api_key = os.environ.get("VOLCENGINE_API_KEY")
-        base_url = os.environ.get("VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
-        model_name = os.environ.get("VOLCENGINE_MODEL_ID", "ark-code-latest")
+    if not os.path.exists(config_path):
+        print(f"⚠️  找不到配置文件 {config_path}")
+        print("请在项目根目录创建 config.json，格式如下：")
+        print("""{
+  "api_key": "your-deepseek-api-key",
+  "model_name": "deepseek-chat",
+  "base_url": "https://api.deepseek.com/v1"
+}""")
+        sys.exit(1)
     
-    if api_key is None:
-        # 尝试从配置文件读，优先读.deepseek_api，再读.volcengine_api
-        api_key_path = os.environ.get("DEEPSEEK_API_KEY_FILE", "/home/node/projects/.deepseek_api")
-        if not os.path.exists(api_key_path):
-            api_key_path = os.environ.get("VOLCENGINE_API_KEY_FILE", "/home/node/projects/.volcengine_api")
-        if os.path.exists(api_key_path):
-            with open(api_key_path, 'r') as f:
-                lines = [line.strip() for line in f if line.strip()]
-                api_key = lines[0]
-                if len(lines) >= 2:
-                    model_name = lines[1]
-        else:
-            print("⚠️  找不到API Key，请设置环境变量：")
-            print("   DeepSeek:")
-            print("   export DEEPSEEK_API_KEY=your-api-key")
-            print("   export DEEPSEEK_MODEL_ID=deepseek-chat")
-            print("或者把api key和model id写入 /home/node/projects/.deepseek_api")
-            sys.exit(1)
+    # 读取并解析配置
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
     
+    api_key = config.get("api_key")
+    model_name = config.get("model_name", "deepseek-chat")
+    base_url = config.get("base_url", "https://api.deepseek.com/v1")
+    
+    if not api_key:
+        print(f"⚠️  config.json 中 api_key 不能为空")
+        sys.exit(1)
+    
+    print(f"Loaded config from {config_path}: model={model_name}")
     print(f"Using model: {model_name}")
     return base_url, api_key, model_name
 

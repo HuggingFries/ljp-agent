@@ -41,6 +41,7 @@ class LJPAgentWithRAG:
     """
     基于正负案例对比+RAG检索的LJP智能体
     自动检索top-k相似正例/负例，注入prompt进行预测
+    支持自适应k，根据相似度自动决定检索数量
     """
     
     def __init__(
@@ -48,10 +49,9 @@ class LJPAgentWithRAG:
         base_url: str,
         api_key: str,
         model_name: str,
-        pos_retriever,
-        neg_retriever,
-        k_positive: int = 1,
-        k_negative: int = 1,
+        adaptive_retriever,
+        k_positive: Optional[int] = None,
+        k_negative: Optional[int] = None,
         charge_names: Optional[List[str]] = None,
         article_names: Optional[List[str]] = None
     ):
@@ -61,14 +61,16 @@ class LJPAgentWithRAG:
         
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model_name = model_name
-        self.pos_retriever = pos_retriever  # 正例检索器
-        self.neg_retriever = neg_retriever  # 负例检索器
-        self.k_positive = k_positive
-        self.k_negative = k_negative
+        self.adaptive_retriever = adaptive_retriever  # 自适应检索器（包含正负检索器）
+        self.k_positive = k_positive  # None表示自适应
+        self.k_negative = k_negative  # None表示自适应
         self.charge_names = charge_names
         self.article_names = article_names
         
-        logger.info(f"LJPAgentWithRAG initialized: model={model_name}, k_pos={k_positive}, k_neg={k_negative}")
+        if k_positive is None and k_negative is None:
+            logger.info(f"LJPAgentWithRAG initialized: model={model_name}, adaptive k enabled")
+        else:
+            logger.info(f"LJPAgentWithRAG initialized: model={model_name}, k_pos={k_positive}, k_neg={k_negative}")
     
     def build_prompt(
         self,
@@ -162,26 +164,23 @@ class LJPAgentWithRAG:
     ) -> PredictionResult:
         """
         完整预测流程：检索 -> 构建prompt -> 预测
+        支持自适应k：根据相似度自动决定检索数量
         """
         # 对目标案件编码
         target_embedding = embedding_model.encode(target_case.fact, normalize_embeddings=True)
         
-        # 检索正负案例
-        # pos_retriever 只存正例，所以取 top-k_positive 作为正例
-        pos_result = self.pos_retriever.retrieve(
-            target_embedding, 
-            k_positive=self.k_positive,
-            k_negative=0
-        )
-        positive_examples = pos_result.positive_examples
-        
-        # neg_retriever 只存负例，所以取 top-k_negative 作为负例
-        neg_result = self.neg_retriever.retrieve(
+        # 自适应检索正负案例
+        retrieval_result = self.adaptive_retriever.retrieve(
             target_embedding,
-            k_positive=self.k_negative,
-            k_negative=0
+            k_positive=self.k_positive,
+            k_negative=self.k_negative
         )
-        negative_examples = neg_result.positive_examples  # 负例库每个case已经标记is_positive=False
+        positive_examples = retrieval_result.positive_examples
+        negative_examples = retrieval_result.negative_examples
+        
+        # 日志记录本次检索k
+        if self.k_positive is None and self.k_negative is None:
+            logger.info(f"Adaptive retrieval done: pos_k={retrieval_result.positive_k}, neg_k={retrieval_result.negative_k}, max_sim_pos={retrieval_result.max_sim_pos:.4f}, max_sim_neg={retrieval_result.max_sim_neg:.4f}")
         
         prompt = self.build_prompt(target_case, positive_examples, negative_examples)
         
@@ -214,13 +213,19 @@ class LJPAgentWithRAG:
             predicted_articles = []
             predicted_judgment = content
         
-        return PredictionResult(
+        result = PredictionResult(
             predicted_charges=predicted_charges,
             predicted_articles=predicted_articles,
             predicted_judgment=predicted_judgment,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens
         )
+        
+        # 附加自适应检索信息，方便日志记录
+        if self.k_positive is None or self.k_negative is None:
+            result.retrieval_info = retrieval_result
+        
+        return result
 
 
 class DataLoader:
