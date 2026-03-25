@@ -92,6 +92,43 @@ def main(min_k=1, max_k=5, alpha=1.0, normalize=False):
     for k in range(min_k, max_k+1):
         cnt = k_list.count(k)
         print(f"  k={k}: {cnt} 个案例 ({cnt/len(k_list)*100:.1f}%)")
+    
+    # 输出每个k对应的top1相似度临界值
+    print(f"\n=== 自适应k临界值（top1相似度范围）===")
+    if normalize:
+        delta = sim_max - sim_min
+        # 对于每个k，找出sim_max临界值
+        # k = round(min_k + (max_k - min_k) * ((sim_max - s) / delta) * alpha)
+        # 反推s：
+        # k - 0.5 = min_k + (max_k - min_k) * ((sim_max - s) / delta) * alpha
+        # => s = sim_max - ((k - 0.5 - min_k) * delta) / ((max_k - min_k) * alpha)
+        print(f"{'k':<5} {'sim_max >':<12} 范围说明")
+        print("-" * 35)
+        prev_critical = sim_max + 0.0001
+        for k in range(min_k, max_k + 1):
+            if k < max_k:
+                critical = sim_max - ((k + 0.5 - min_k) * delta) / ((max_k - min_k) * alpha)
+                print(f"k={k:<3} {'>':<2} {critical:<10.4f}  ({critical:.4f} < sim_max ≤ {prev_critical:.4f})")
+                prev_critical = critical
+            else:
+                # 最后一个k
+                critical = sim_max - ((k - 0.5 - min_k) * delta) / ((max_k - min_k) * alpha)
+                print(f"k={k:<3}    ≤ {critical:<10.4f}  (sim_max ≤ {critical:.4f})")
+    else:
+        # 非归一化版本，sim_max是原始相似度
+        # k = round(min_k + (max_k - min_k) * (1 - sim_max) * alpha)
+        print(f"{'k':<5} {'sim_max >':<12} 范围说明")
+        print("-" * 35)
+        prev_critical = 1.0001
+        for k in range(min_k, max_k + 1):
+            if k < max_k:
+                critical = 1 - ((k + 0.5 - min_k)) / ((max_k - min_k) * alpha)
+                print(f"k={k:<3} {'>':<2} {critical:<10.4f}  ({critical:.4f} < sim_max ≤ {prev_critical:.4f})")
+                prev_critical = critical
+            else:
+                critical = 1 - ((k - 0.5 - min_k)) / ((max_k - min_k) * alpha)
+                print(f"k={k:<3}    ≤ {critical:<10.4f}  (sim_max ≤ {critical:.4f})")
+
 
 
 if __name__ == "__main__":
