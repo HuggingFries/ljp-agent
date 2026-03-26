@@ -172,6 +172,7 @@ class LJPAgentWithRAG:
         # 自适应检索正负案例
         retrieval_result = self.adaptive_retriever.retrieve(
             target_embedding,
+            target_fact=target_case.fact,
             k_positive=self.k_positive,
             k_negative=self.k_negative
         )

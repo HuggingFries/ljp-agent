@@ -1,136 +1,140 @@
-# LJP-RAG: 基于正负案例对比RAG的法律判决预测
+# LJP-RAG Agent
 
-基于RAG+prompt工程的法律判决预测智能体，核心思想是引入**正负案例对比**作为上下文，提升大语言模型判决预测准确性。
+Legal Judgment Prediction with Retrieval-Augmented Generation and Adaptive k.
 
-v1.1新增**自适应k检索**：根据输入案件与检索库的最大相似度，动态调整检索案例数。相似度越高，k越小；相似度越低，k越大。
+支持多种自适应k策略，自动决定检索多少个案例。
 
-## 项目结构
+## 配置
 
-```
-ljp-agent/
-├── agent.py                 # 核心RAG智能体框架
-├── retriever.py             # 检索器：支持固定k和自适应k
-├── main.py                  # 主入口，API配置加载
-├── run_agent.py             # 独立运行脚本：批量评估 + 单案件预测
-├── compare_baseline_rag.py  # 基线模型与RAG对比实验
-├── baseline.py              # Zero-Shot基线实现
-├── analyze_sim_dist.py      # 相似度分布分析工具
-├── requirements.txt         # Python依赖
-└── data/
-    ├── cail2018/            # CAIL2018数据集（标签文件）
-    └── ...                 # 生成的正负案例索引
-```
+所有超参数都在 `config.json` 中配置：
 
-## 核心方法
-
-1. **正例检索**: 检索与目标案件最相似的已判决案例作为正例，告诉模型"类似案件应该怎么判"
-2. **负例选择**: 选择易混淆/不相似案例作为负例，告诉模型"不要怎么判"
-3. **自适应k**: 根据最大相似度动态调整检索案例数，避免冗余也保证信息充分
-4. **prompt工程**: 将正负案例组织成prompt，输入大模型进行判决预测
-
-## 环境配置
-
-```bash
-# 创建conda环境
-conda create -n ljp-agent python=3.11
-conda activate ljp-agent
-
-# 安装依赖
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 配置API密钥
-cp config.json.example config.json
-# 编辑config.json填入你的API信息
+```json
 {
-  "base_url": "https://your-api-base-url.com/v1",
-  "api_key": "your-api-key",
-  "model_name": "your-model-name"
+  "api": {
+    "base_url_env": "OPENAI_BASE_URL",    // 从环境变量读API base url
+    "api_key_env": "OPENAI_API_KEY",      // 从环境变量读API key
+    "model_name_env": "OPENAI_MODEL"      // 从环境变量读模型名称
+  },
+  "retriever": {
+    "positive": {
+      "adaptive_mode": "static",         // 自适应k模式: "static" | "llm"
+      "static": {                       // static 模式参数（数学公式计算）
+        "min_k": 1,                     // 最小返回k
+        "max_k": 5,                     // 最大返回k
+        "alpha": 1.0,                   // 缩放系数: k = min_k + (max_k - min_k) * (1 - sim_max) * alpha
+        "normalize": false,             // 是否对sim_max做归一化
+        "sim_min": null,                // 归一化最小sim（null自动计算）
+        "sim_max": null                 // 归一化最大sim（null自动计算）
+      },
+      "llm": {                         // llm 模式参数（大模型验证相关性）
+        "min_k": 1,                     // 最小保证返回
+        "max_k": 5,                     // 最大返回，避免上下文溢出
+        "candidate_k": 10,              // embedding粗筛给大模型评估的候选数
+        "min_score_threshold": 3         // 最低相关性分数（1-5），低于过滤
+      }
+    },
+    "negative": {                       // 负例检索器配置，结构和positive一样
+      "adaptive_mode": "static",
+      "static": { ... },
+      "llm": { ... }
+    }
+  },
+  "index": {
+    "index_dir": "data",                // 索引存放目录
+    "embedding_model": "uer/sbert-base-chinese-nli"  // embedding模型
+  },
+  "evaluation": {
+    "test_file": "data/final_all_data/first_stage/test.json",  // 默认测试集
+    "seed": 42                          // 采样随机种子
+  },
+  "logging": {
+    "level": "INFO"                     // 日志级别
+  }
 }
 ```
 
-## 数据准备
+## 两种自适应k模式
 
-本项目使用CAIL2018数据集：
+### 1. static 模式（默认）
+- **原理**: 根据最大相似度数学公式计算k：`sim_max`越大 → k越小，`sim_max`越小 → k越大
+- **优点**: 速度快，不需要额外大模型调用
+- **配置**: 在 `config.json` 中设置 `retriever.positive.adaptive_mode = "static"`
 
-1. 从[CAIL2018](https://github.com/china-ai-law-challenge/CAIL2018)下载数据
-2. 放入`data/cail2018/`目录
-3. 运行数据处理脚本分割正负案例（或使用预处理好的索引）
+### 2. llm 模式（大模型验证）
+- **原理**: embedding先粗筛top10，让大模型给每个候选打法律相关性分（1-5），只保留≥阈值的，个数就是k
+- **优点**: 解决「语义相似 ≠ 法律相似」问题，大模型懂法律构成要件，过滤掉不相关的
+- **配置**: 在 `config.json` 中设置 `retriever.positive.adaptive_mode = "llm"`，negative同理
+- **开销**: 每个案件需要 `candidate_k` 次大模型调用（默认10次），精度更高但更慢
 
-## 使用方法
+正负例可以**独立配置不同模式**，比如：
+```json
+"positive": { "adaptive_mode": "llm" },
+"negative": { "adaptive_mode": "static" }
+```
 
-### 1. 批量评估（测试集评估准确率）
+## 运行
 
+### 环境变量
+先设置API环境变量（对应config.json里配置的名称）：
 ```bash
-# 自适应k（推荐，min_k=1, max_k=5）
-python run_agent.py --max-samples 100 --min-k 1 --max-k 5
-
-# 固定k对比
-python run_agent.py --max-samples 100 --k-positive 3 --k-negative 2
-
-# 开启相似度归一化，让k分布更均匀
-python run_agent.py --max-samples 100 --min-k 1 --max-k 5 --normalize
-
-# 指定自定义测试文件
-python run_agent.py --test-file /path/to/test.json --max-samples 100
-
-# 结果会保存在 results/ 目录，包含：
-# - 整体准确率、precision、recall、F1
-# - 每个样本的预测详情和自适应k信息
+export OPENAI_BASE_URL="your-api-base-url"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="model-name"
 ```
 
-### 2. 单案件预测（直接输入事实，输出判决）
-
+### 批量评估
 ```bash
-# 直接输入案件事实
-python run_agent.py --fact "被告人张三于2023年1月1日，在北京市朝阳区盗窃他人人民币五千元，数额较大"
+# 使用默认配置（config.json），采样50个样本
+python run_agent.py --max-samples 50
 
-# 从JSON文件输入（需包含fact字段）
-python run_agent.py --input case.json --output result.json
+# 指定配置文件，自定义采样数和输出
+python run_agent.py --config config-static.json --max-samples 100 --output results/static.json
 
-# 输出会包含预测罪名、相关法条、完整判决理由，以及自适应检索信息
+# 强制固定k
+python run_agent.py --max-samples 50 --k-positive 3 --k-negative 1
 ```
 
-### 3. 与Zero-Shot基线对比
-
+### 单案件预测
 ```bash
-# 对比基线和RAG性能
-python compare_baseline_rag.py --max-samples 100
+# 直接输入事实
+python run_agent.py --fact "被告人张三于2023年1月1日在南京市盗窃了被害人李四的人民币一万元..."
+
+# 从json文件输入
+python run_agent.py --input case.json
 ```
 
-## 自适应k算法
+## 文件结构
 
-```python
-# 公式：k = round(min_k + (max_k - min_k) * (1 - sim_max))
-# - sim_max越高（找到高相似案例）→ k越小，结果聚焦
-# - sim_max越低（没找到高相似案例）→ k越大，提供更多参考
-
-# 例子：
-sim_max=0.9 → k≈1  (高相似，只需要最相似的1个案例)
-sim_max=0.5 → k≈3  (中等相似，需要3个参考)
-sim_max=0.1 → k≈5  (低相似，需要最多5个参考)
+```
+├── config.json          # 主配置文件
+├── run_agent.py        # 入口脚本
+├── agent.py            # LJP Agent 核心框架
+├── retriever.py        # 检索器（支持多种自适应k策略）
+├── build_index.py      # 构建embedding索引
+├── evaluate_*.py      # 评估脚本
+├── requirements.txt   # 依赖
+├── data/              # 数据和索引
+└── results/          # 评估结果输出
 ```
 
-## 实验结果
+## 依赖安装
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
 
-在CAIL2018 100随机样本上：
+## 对比实验
 
-| 方法 | 罪名准确率 | 法条准确率 |
-|------|-----------|-----------|
-| Zero-Shot基线 | XX.XX% | XX.XX% |
-| RAG + 固定k (pos=3, neg=2) | +XX% | +XX% |
-| RAG + 自适应k (1-5) | **XX.XX%** | **XX.XX%** |
+方便对比不同自适应k策略：
+```bash
+# 静态数学公式
+cp config.json config-static.json
+# 编辑 config-static.json 设置 adaptive_mode: "static"
+python run_agent.py --config config-static.json --max-samples 50 --output results/static.json
 
-*待补充完整实验结果*
+# 大模型验证
+cp config.json config-llm.json
+# 编辑 config-llm.json 设置 adaptive_mode: "llm"
+python run_agent.py --config config-llm.json --max-samples 50 --output results/llm.json
+```
 
-## 负例选择策略
-
-- **farthest**: 选择距离最远（最不相似）作为负例
-- **random**: 随机从剩余案例中选择
-
-## 数据集
-
-- [CAIL2018](https://github.com/china-ai-law-challenge/CAIL2018): 中国法律智能挑战数据集，标准LJP数据集
-
-## License
-
-MIT
+然后比较两个结果文件的准确率就行。

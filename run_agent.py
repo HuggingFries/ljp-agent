@@ -1,6 +1,8 @@
 """
 单独运行LJP RAG Agent (no baseline)
 支持批量测试和单案件预测
+
+配置从config.json读取，命令行参数可以覆盖配置
 """
 
 import argparse
@@ -30,12 +32,14 @@ except ImportError:
     print("   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple")
     sys.exit(1)
 
+from agent import Case, DataLoader, LJPAgentWithRAG, PredictionResult
+from retriever import (
+    AdaptiveRAGRetriever,
+    create_retriever_from_config,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-from agent import Case, DataLoader, LJPAgentWithRAG, PredictionResult
-from retriever import EmbeddingRetriever, AdaptiveRAGRetriever
-from main import load_api_config
 
 
 def clean_charge(charge: str) -> str:
@@ -145,19 +149,37 @@ def evaluate_batch(
 
 
 def load_rag_index(
-    index_dir: str = "data",
-    embedding_model_name: str = "uer/sbert-base-chinese-nli",
-    min_k: int = 1,
-    max_k: int = 5,
-    alpha: float = 1.0,
-    normalize: bool = False,
-    sim_min: float | None = None,
-    sim_max: float | None = None,
+    config: dict,
+    llm_client=None,
+    llm_model=None,
 ) -> tuple[AdaptiveRAGRetriever, any]:
+    """从配置加载RAG索引
+    
+    Args:
+        config: 全局配置字典
+        llm_client: 大模型客户端，llm模式需要
+        llm_model: 大模型名称，llm模式需要
+    
+    Returns:
+        (adaptive_retriever, embedding_model)
+    """
+    index_config = config.get("index", {})
+    index_dir = index_config.get("index_dir", "data")
+    embedding_model_name = index_config.get("embedding_model", "uer/sbert-base-chinese-nli")
+    
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     from sentence_transformers import SentenceTransformer
     embedding_model = SentenceTransformer(embedding_model_name)
     
+    # 从配置创建检索器
+    retriever_config = config.get("retriever", {})
+    adaptive_retriever = create_retriever_from_config(
+        retriever_config,
+        llm_client=llm_client,
+        llm_model=llm_model,
+    )
+    
+    # 加载案例和预计算embeddings
     pos_cases_path = os.path.join(index_dir, "pos_cases.json")
     pos_index_path = os.path.join(index_dir, "pos_index.npy")
     
@@ -176,14 +198,7 @@ def load_rag_index(
     
     import numpy as np
     pos_embeddings = np.load(pos_index_path)
-    pos_retriever = EmbeddingRetriever(
-        embedding_model=None,
-        min_k=min_k,
-        max_k=max_k,
-        alpha=alpha,
-        normalize=normalize
-    )
-    pos_retriever.index(pos_cases, pos_embeddings)
+    adaptive_retriever.pos_retriever.index(pos_cases, pos_embeddings)
     
     neg_cases_path = os.path.join(index_dir, "neg_cases.json")
     neg_index_path = os.path.join(index_dir, "neg_index.npy")
@@ -202,100 +217,91 @@ def load_rag_index(
         ))
     
     neg_embeddings = np.load(neg_index_path)
-    neg_retriever = EmbeddingRetriever(
-        embedding_model=None,
-        min_k=min_k,
-        max_k=max_k,
-        alpha=alpha,
-        normalize=normalize
-    )
-    neg_retriever.index(neg_cases, neg_embeddings)
+    adaptive_retriever.neg_retriever.index(neg_cases, neg_embeddings)
     
-    # 如果开启normalize，自动计算参数
-    if normalize:
-        if (sim_min is None or sim_max is None):
-            import numpy as np
-            pos_emb = pos_embeddings
-            neg_emb = neg_embeddings
-            all_emb = np.vstack([pos_emb, neg_emb])
-            norm = np.linalg.norm(all_emb, axis=1, keepdims=True)
-            norm_emb = all_emb / norm
-            sim_matrix = norm_emb @ norm_emb.T
-            sim_max_list = []
-            for i in range(sim_matrix.shape[0]):
-                row = sim_matrix[i].copy()
-                row[i] = 0
-                sim_max_list.append(row.max())
-            auto_sim_min = np.min(sim_max_list)
-            auto_sim_max = np.max(sim_max_list)
-            sim_min = sim_min if sim_min is not None else auto_sim_min
-            sim_max = sim_max if sim_max is not None else auto_sim_max
-            pos_retriever.set_normalization_params(sim_min, sim_max)
-            neg_retriever.set_normalization_params(sim_min, sim_max)
-            logger.info(f"Auto computed normalization params: sim_min={sim_min:.4f}, sim_max={sim_max:.4f}")
-    
-    adaptive_retriever = AdaptiveRAGRetriever(pos_retriever, neg_retriever)
-    
-    logger.info(f"Loaded positive index: {len(pos_cases)} cases (min_k={min_k}, max_k={max_k}, alpha={alpha}, normalize={normalize})")
-    logger.info(f"Loaded negative index: {len(neg_cases)} cases (min_k={min_k}, max_k={max_k}, alpha={alpha}, normalize={normalize})")
+    # 日志
+    logger.info(f"Loaded positive index: {len(pos_cases)} cases, mode={adaptive_retriever.pos_retriever.config.adaptive_mode}")
+    logger.info(f"Loaded negative index: {len(neg_cases)} cases, mode={adaptive_retriever.neg_retriever.config.adaptive_mode}")
     
     return adaptive_retriever, embedding_model
 
 
+def load_api_config(config: dict):
+    """加载API配置
+    - base_url: 直接填写base url
+    - api_key_env: 从环境变量读取api key（保护隐私，不放在配置里）
+    - model_name: 直接填写模型名称
+    """
+    api_config = config.get("api", {})
+    # base_url 和 model_name 直接从配置读，api_key 从环境变量读
+    base_url = api_config.get("base_url")
+    api_key_env = api_config.get("api_key_env", "DEEPSEEK_API_KEY")
+    model_name = api_config.get("model_name")
+    
+    api_key = os.getenv(api_key_env)
+    
+    if not all([base_url, api_key, model_name]):
+        raise ValueError(
+            f"Missing API configuration:\n"
+            f"  - base_url: {base_url}\n"
+            f"  - api_key from env '{api_key_env}': {api_key is not None}\n"
+            f"  - model_name: {model_name}\n"
+            f"Please check config.json and environment variable."
+        )
+    
+    return base_url, api_key, model_name
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Run LJP RAG Agent (no baseline)')
-    # 批量测试参数（和compare一致）
-    parser.add_argument('--test-file', type=str, default='data/final_all_data/first_stage/test.json',
-                       help='CAIL2018 test.json path (default: data/final_all_data/first_stage/test.json)')
-    parser.add_argument('--max-samples', type=int, default=None,
-                       help='Number of samples to evaluate (None=run single, not batch)')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed for sampling')
+    parser = argparse.ArgumentParser(description='Run LJP RAG Agent (no baseline), config loaded from config.json')
+    # 配置文件
+    parser.add_argument('--config', type=str, default='config.json', help='配置文件路径，默认=config.json')
+    # 批量测试参数
+    parser.add_argument('--test-file', type=str, default=None, help='CAIL2018 test.json path，覆盖配置文件')
+    parser.add_argument('--max-samples', type=int, default=None, help='Number of samples to evaluate (None=run single, not batch)')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for sampling，覆盖配置文件')
     # 单案件参数
     parser.add_argument('--input', type=str, help='输入案件文件 (json格式，包含fact字段)')
     parser.add_argument('--fact', type=str, help='直接输入案件事实文本')
-    # 检索参数
-    parser.add_argument('--k-positive', type=int, default=None, help='固定正例数，None=自适应')
-    parser.add_argument('--k-negative', type=int, default=None, help='固定负例数，None=自适应')
-    parser.add_argument('--min-k', type=int, default=1, help='自适应最小k')
-    parser.add_argument('--max-k', type=int, default=5, help='自适应最大k')
-    parser.add_argument('--alpha', type=float, default=1.0, help='Scaling factor for adaptive k: larger alpha = larger k')
-    parser.add_argument('--normalize', action='store_true', help='Normalize sim_max to get more uniform k distribution')
-    parser.add_argument('--sim-min', type=float, default=None, help='Minimum sim_max for normalization (auto detect if None)')
-    parser.add_argument('--sim-max', type=float, default=None, help='Maximum sim_max for normalization (auto detect if None)')
-    parser.add_argument('--index-dir', type=str, default='data', help='索引目录')
-    parser.add_argument('--embedding-model', type=str, default='uer/sbert-base-chinese-nli', help='embedding模型名称')
+    # 固定k覆盖（不使用自适应）
+    parser.add_argument('--k-positive', type=int, default=None, help='固定正例数，None=使用配置自适应')
+    parser.add_argument('--k-negative', type=int, default=None, help='固定负例数，None=使用配置自适应')
+    # 索引
+    parser.add_argument('--index-dir', type=str, default=None, help='索引目录，覆盖配置文件')
+    parser.add_argument('--embedding-model', type=str, default=None, help='embedding模型名称，覆盖配置文件')
     # 输出
     parser.add_argument('--output', type=str, default=None, help='输出结果到json文件')
     args = parser.parse_args()
     
+    # 读取配置文件
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    # 设置日志级别
+    log_config = config.get("logging", {})
+    log_level = getattr(logging, log_config.get("level", "INFO").upper(), logging.INFO)
+    logging.getLogger().setLevel(log_level)
+    
     # 加载API配置
-    base_url, api_key, model_name = load_api_config()
+    base_url, api_key, model_name = load_api_config(config)
     
-    # 如果开启normalize，自动计算sim_min/sim_max
-    sim_min = args.sim_min
-    sim_max = args.sim_max
-    if args.normalize and (sim_min is None or sim_max is None):
-        import numpy as np
-        pos_emb = np.load(os.path.join(args.index_dir, "pos_index.npy"), allow_pickle=False)
-        neg_emb = np.load(os.path.join(args.index_dir, "neg_index.npy"), allow_pickle=False)
-        all_emb = np.vstack([pos_emb, neg_emb])
-        norm = np.linalg.norm(all_emb, axis=1, keepdims=True)
-        norm_emb = all_emb / norm
-        sim_matrix = norm_emb @ norm_emb.T
-        sim_max_list = []
-        for i in range(sim_matrix.shape[0]):
-            row = sim_matrix[i].copy()
-            row[i] = 0
-            sim_max_list.append(float(row.max()))
-        auto_sim_min = float(np.min(sim_max_list))
-        auto_sim_max = float(np.max(sim_max_list))
-        sim_min = sim_min if sim_min is not None else auto_sim_min
-        sim_max = sim_max if sim_max is not None else auto_sim_max
+    # 覆盖索引配置
+    if args.index_dir is not None:
+        config.setdefault("index", {})["index_dir"] = args.index_dir
+    if args.embedding_model is not None:
+        config.setdefault("index", {})["embedding_model"] = args.embedding_model
     
-    # 加载RAG索引
+    # 加载RAG索引（如果是llm模式，需要传入llm_client）
+    from openai import OpenAI
+    # 排除代理
+    os.environ['HTTP_PROXY'] = ''
+    os.environ['HTTPS_PROXY'] = ''
+    llm_client = OpenAI(base_url=base_url, api_key=api_key)
+    
     adaptive_retriever, embedding_model = load_rag_index(
-        args.index_dir, args.embedding_model, args.min_k, args.max_k, args.alpha, args.normalize, sim_min, sim_max
+        config,
+        llm_client=llm_client,
+        llm_model=model_name,
     )
     
     # 加载标签映射
@@ -309,6 +315,8 @@ def main():
     if os.path.exists(article_path):
         with open(article_path, 'r', encoding='utf-8') as f:
             article_names = [line.strip() for line in f if line.strip()]
+    else:
+        article_names = []
     
     # 初始化agent
     agent = LJPAgentWithRAG(
@@ -324,20 +332,26 @@ def main():
     
     # ========== 批量测试模式 ==========
     if args.max_samples is not None:
+        eval_config = config.get("evaluation", {})
+        test_file = args.test_file or eval_config.get("test_file", 'data/final_all_data/first_stage/test.json')
+        seed = args.seed or eval_config.get("seed", 42)
+        
         print("\n" + "="*60)
         if args.k_positive is None and args.k_negative is None:
-            print(f"=== Batch Evaluation: Adaptive k (min={args.min_k}, max={args.max_k}, alpha={args.alpha}, normalize={args.normalize}) ===")
+            pos_mode = adaptive_retriever.pos_retriever.config.adaptive_mode
+            neg_mode = adaptive_retriever.neg_retriever.config.adaptive_mode
+            print(f"=== Batch Evaluation: Adaptive k (pos_mode={pos_mode}, neg_mode={neg_mode}) ===")
         else:
             print(f"=== Batch Evaluation: Fixed k (pos={args.k_positive}, neg={args.k_negative}) ===")
         print("="*60)
         # 加载并采样测试数据
-        random.seed(args.seed)
-        test_data_full = DataLoader.load_cail2018(args.test_file)
+        random.seed(seed)
+        test_data_full = DataLoader.load_cail2018(test_file)
         if args.max_samples is not None and args.max_samples < len(test_data_full):
             test_data = random.sample(test_data_full, args.max_samples)
         else:
             test_data = test_data_full
-        logger.info(f"Sampled {len(test_data)} test samples (seed={args.seed})")
+        logger.info(f"Sampled {len(test_data)} test samples (seed={seed})")
         
         # 评估
         acc_charge, acc_article, precision, recall, f1, details = evaluate_batch(
@@ -359,33 +373,30 @@ def main():
         
         # 保存结果
         os.makedirs("results", exist_ok=True)
-        # 文件名保持和compare一致
-        if args.k_positive is None and args.k_negative is None:
-            output_file = os.path.join(
-                "results", 
-                f"agent_s{args.seed}_n{args.max_samples}_adaptive_min{args.min_k}_max{args.max_k}.json"
-            )
-        elif args.output is None:
-            output_file = os.path.join(
-                "results", 
-                f"agent_s{args.seed}_n{args.max_samples}_fixed_pos{args.k_positive}_neg{args.k_negative}.json"
-            )
+        # 文件名
+        if args.output is None:
+            if args.k_positive is None and args.k_negative is None:
+                pos_mode = adaptive_retriever.pos_retriever.config.adaptive_mode
+                output_file = os.path.join(
+                    "results", 
+                    f"agent_s{seed}_n{args.max_samples}_{pos_mode}.json"
+                )
+            else:
+                output_file = os.path.join(
+                    "results", 
+                    f"agent_s{seed}_n{args.max_samples}_fixed_pos{args.k_positive}_neg{args.k_negative}.json"
+                )
         else:
             output_file = args.output
         output = {
             "settings": {
+                "config_file": args.config,
                 "max_samples": args.max_samples,
                 "k_positive": args.k_positive,
                 "k_negative": args.k_negative,
-                "min_k": args.min_k,
-                "max_k": args.max_k,
-                "alpha": args.alpha,
-                "normalize": args.normalize,
-                "sim_min": float(sim_min) if sim_min is not None else None,
-                "sim_max": float(sim_max) if sim_max is not None else None,
-                "seed": args.seed,
-                "test_file": args.test_file,
-                "embedding_model": args.embedding_model,
+                "seed": seed,
+                "test_file": test_file,
+                "retriever_config": config.get("retriever", {}),
             },
             "metrics": {
                 "acc_charge": acc_charge,
@@ -473,8 +484,8 @@ def main():
                 }
                 with open(args.output, 'w', encoding='utf-8') as f:
                     json.dump(output, f, ensure_ascii=False, indent=2)
-                logger.info(f"Result saved to {args.output}")
-        
+                logger.info(f"Result saved to {output}")
+            
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
             sys.exit(1)

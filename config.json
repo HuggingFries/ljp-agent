@@ -1,0 +1,54 @@
+{
+  "api": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "model_name": "deepseek-chat"
+  },
+  "retriever": {
+    "positive": {
+      "adaptive_mode": "llm",
+      "static": {
+        "min_k": 1,
+        "max_k": 5,
+        "alpha": 1.0,
+        "normalize": false,
+        "sim_min": null,
+        "sim_max": null
+      },
+      "llm": {
+        "min_k": 1,
+        "max_k": 5,
+        "initial_candidates": 20,
+        "step_add": 2
+      }
+    },
+    "negative": {
+      "adaptive_mode": "llm",
+      "static": {
+        "min_k": 1,
+        "max_k": 5,
+        "alpha": 1.0,
+        "normalize": false,
+        "sim_min": null,
+        "sim_max": null
+      },
+      "llm": {
+        "min_k": 1,
+        "max_k": 5,
+        "initial_candidates": 20,
+        "step_add": 2
+      }
+    }
+  },
+  "index": {
+    "index_dir": "data",
+    "embedding_model": "uer/sbert-base-chinese-nli"
+  },
+  "evaluation": {
+    "test_file": "data/final_all_data/first_stage/test.json",
+    "seed": 42
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
