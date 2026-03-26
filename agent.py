@@ -132,6 +132,59 @@ class LJPAgentWithRAG:
         
         return "\n".join(prompt_parts)
     
+    def _predict_candidate_charges(self, target_fact: str, total_charges: int) -> List[str]:
+        """让大模型预测目标案件可能涉及的罪名，输出top-N候选（用来过滤检索范围）
+        
+        Args:
+            target_fact: 目标案件事实
+            total_charges: 总共多少个可选罪名，输出最多 min(5, total_charges) 个
+        
+        Returns:
+            List[str]: 候选罪名列表
+        """
+        n = min(5, total_charges)
+        prompt = f"""你是一个法律AI助手，需要根据案件事实预测可能涉及的罪名。
+
+## 案件事实
+{target_fact}
+
+## 可选罪名列表
+{', '.join(self.charge_names[:100])}
+... (总共 {total_charges} 个罪名，只列了前100个)
+
+## 任务
+请从可选罪名列表中选出 {n} 个最可能涉及的罪名，直接输出罪名列表，不要输出其他内容。输出格式：
+
+罪名: 罪名1, 罪名2, ...
+
+注意：
+- 直接输出罪名名称，不要带"罪"字后缀（比如输出"故意伤害"，不是"故意伤害罪"）
+- 选最可能的 {n} 个，不要多也不要少
+"""
+        
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        content = response.choices[0].message.content.strip()
+        
+        # 解析罪名
+        import re
+        # 匹配"罪名: ..."
+        if "罪名:" in content:
+            content = content.split("罪名:")[1].strip()
+        # 分割
+        charges = [c.strip() for c in re.split(r'[，,\n]+', content) if c.strip()]
+        # 去掉"罪"后缀
+        charges = [c[:-1] if c.endswith("罪") else c for c in charges]
+        # 去重
+        charges = list(dict.fromkeys(charges))
+        # 截断到n个
+        charges = charges[:n]
+        
+        return charges
+    
     def _default_system_prompt(self) -> str:
         return """你是一个专业的法律AI助手，擅长中国刑事案件判决预测。
 下面会给你提供一些参考案例，分为正例和负例：
@@ -163,19 +216,37 @@ class LJPAgentWithRAG:
         embedding_model
     ) -> PredictionResult:
         """
-        完整预测流程：检索 -> 构建prompt -> 预测
+        完整预测流程：
+        如果是普通检索器：[罪名预测 → 分层检索 → 构建prompt → 预测
+        如果是平面检索：直接检索 → 构建prompt → 预测
         支持自适应k：根据相似度自动决定检索数量
         """
         # 对目标案件编码
         target_embedding = embedding_model.encode(target_case.fact, normalize_embeddings=True)
+        target_fact = target_case.fact
         
         # 自适应检索正负案例
-        retrieval_result = self.adaptive_retriever.retrieve(
-            target_embedding,
-            target_fact=target_case.fact,
-            k_positive=self.k_positive,
-            k_negative=self.k_negative
-        )
+        # 如果是分层检索，第一步需要先预测候选罪名
+        if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'pos_charge_list'):
+            # 第一步：预测候选罪名
+            candidate_charges = self._predict_candidate_charges(target_fact, len(self.charge_names))
+            logger.info(f"LLM predicted candidate charges: {candidate_charges}")
+            # 分层检索
+            retrieval_result = self.adaptive_retriever.retrieve(
+                target_embedding,
+                target_fact=target_fact,
+                candidate_charges=candidate_charges,
+                k_positive=self.k_positive,
+                k_negative=self.k_negative
+            )
+        else:
+            # 普通平面检索
+            retrieval_result = self.adaptive_retriever.retrieve(
+                target_embedding,
+                target_fact=target_fact,
+                k_positive=self.k_positive,
+                k_negative=self.k_negative
+            )
         positive_examples = retrieval_result.positive_examples
         negative_examples = retrieval_result.negative_examples
         

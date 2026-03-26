@@ -255,7 +255,7 @@ class LLMVerifiedAdaptiveKStrategy:
         k = len(selected)
         k = max(config.min_k, min(config.max_k, k))
         
-        logger.debug(f"LLM-Verified iterative adaptive k: start={config.min_k}, final={k}, max={config.max_k}")
+        logger.info(f"[LLM-Verified 迭代验证] start={config.min_k}, final={k}, max={config.max_k}")
         return k
 
 
@@ -560,9 +560,310 @@ def create_retriever_from_config(
     return AdaptiveRAGRetriever(pos_retriever, neg_retriever)
 
 
+@dataclass
+class HierarchicalRetrieverConfig:
+    """分层检索器配置
+    
+    Attributes:
+        index_root: 分层索引根目录
+        embedding_model_name: embedding模型名称
+        min_k: 最少返回案例数
+        max_k: 最多返回案例数
+        coarse_k: 语义粗筛返回多少候选给LLM验证
+        adaptive_mode: 最终精筛的自适应模式: "static" | "llm"
+        static_config: static模式配置
+        llm_config: llm模式配置
+    """
+    index_root: str = "data/index_by_charge"
+    embedding_model_name: str = "uer/sbert-base-chinese-nli"
+    min_k: int = 1
+    max_k: int = 5
+    coarse_k: int = 10
+    adaptive_mode: str = "llm"
+    static_config: StaticAdaptiveKConfig = None
+    llm_config: LLMVerifiedAdaptiveKConfig = None
+
+
+class HierarchicalEmbeddingRetriever:
+    """分层检索器
+    [1. 罪名候选] → [2. 范围过滤] → [3. 语义粗筛] → [4. LLM验证精筛]
+    
+    Attributes:
+        config: 分层检索配置
+        llm_client: 大模型客户端（给精筛用）
+        llm_model: 大模型名称（给精筛用）
+    """
+    
+    def __init__(
+        self,
+        config: HierarchicalRetrieverConfig,
+        llm_client: Optional[Any] = None,
+        llm_model: Optional[str] = None,
+    ):
+        self.config = config
+        self.llm_client = llm_client
+        self.llm_model = llm_model
+        
+        # 加载罪名列表
+        self.pos_charge_list = self._load_charge_list("pos")
+        self.neg_charge_list = self._load_charge_list("neg")
+        
+        # 预加载所有案例和embeddings到内存（数据集小，没问题）
+        self.pos_cases: Dict[str, List[Case]] = {}
+        self.pos_embeddings: Dict[str, np.ndarray] = {}
+        for charge in self.pos_charge_list:
+            cases, embeddings = self._load_charge_index("pos", charge)
+            self.pos_cases[charge] = cases
+            self.pos_embeddings[charge] = embeddings
+        
+        self.neg_cases: Dict[str, List[Case]] = {}
+        self.neg_embeddings: Dict[str, np.ndarray] = {}
+        for charge in self.neg_charge_list:
+            cases, embeddings = self._load_charge_index("neg", charge)
+            self.neg_cases[charge] = cases
+            self.neg_embeddings[charge] = embeddings
+        
+        # 初始化精筛策略
+        self._init_strategy()
+        
+        logger.info(f"Loaded hierarchical retriever:")
+        logger.info(f"  Positive charges: {len(self.pos_charge_list)}, total cases: {sum(len(v) for v in self.pos_cases.values())}")
+        logger.info(f"  Negative charges: {len(self.neg_charge_list)}, total cases: {sum(len(v) for v in self.neg_cases.values())}")
+        logger.info(f"  Fine adaptive mode: {config.adaptive_mode}, coarse_k={config.coarse_k}")
+    
+    def _load_charge_list(self, prefix: str) -> List[str]:
+        """加载罪名列表"""
+        charge_list_path = os.path.join(self.config.index_root, f"{prefix}_charge_list.json")
+        if not os.path.exists(charge_list_path):
+            logger.warning(f"Charge list not found: {charge_list_path}")
+            return []
+        with open(charge_list_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    def _load_charge_index(self, prefix: str, charge: str) -> Tuple[List[Case], np.ndarray]:
+        """加载单个罪名的索引"""
+        safe_charge = charge.replace('/', '_')
+        charge_dir = os.path.join(self.config.index_root, prefix, safe_charge)
+        cases_path = os.path.join(charge_dir, "cases.json")
+        index_path = os.path.join(charge_dir, "index.npy")
+        
+        with open(cases_path, 'r', encoding='utf-8') as f:
+            cases_data = json.load(f)
+        
+        cases: List[Case] = []
+        for item in cases_data:
+            cases.append(Case(
+                fact=item['fact'],
+                charges=item['charges'],
+                articles=item['articles'],
+                judgment='',
+                is_positive=item['is_positive'],
+            ))
+        
+        embeddings = np.load(index_path)
+        return cases, embeddings
+    
+    def _init_strategy(self):
+        """初始化精筛策略"""
+        config = self.config
+        if config.adaptive_mode == "static":
+            if config.static_config is None:
+                config.static_config = StaticAdaptiveKConfig(
+                    min_k=config.min_k,
+                    max_k=config.max_k,
+                )
+            self.strategy: AdaptiveKStrategy = StaticAdaptiveKStrategy(config.static_config)
+        elif config.adaptive_mode == "llm":
+            if config.llm_config is None:
+                config.llm_config = LLMVerifiedAdaptiveKConfig(
+                    min_k=config.min_k,
+                    max_k=config.max_k,
+                )
+            self.strategy: AdaptiveKStrategy = LLMVerifiedAdaptiveKStrategy(
+                config.llm_config,
+                self.llm_client,
+                self.llm_model,
+            )
+        else:
+            raise ValueError(f"Unknown adaptive_mode: {config.adaptive_mode}")
+    
+    def retrieve_topk(
+        self,
+        target_embedding: np.ndarray,
+        target_fact: str,
+        candidate_charges: List[str],
+        k: Optional[int] = None,
+    ) -> Tuple[List[Case], float, int]:
+        """分层检索top-k
+        Args:
+            target_embedding: 目标案件embedding
+            target_fact: 目标案件事实（给LLM验证用）
+            candidate_charges: 大模型预测的候选罪名
+            k: 固定k，None则自适应
+        Returns:
+            (top_cases, max_sim, final_k)
+        """
+        # 收集所有候选罪名对应的案例和embedding
+        all_cases: List[Case] = []
+        all_embeddings: List[np.ndarray] = []
+        
+        for charge in candidate_charges:
+            # 格式化罪名（去掉罪后缀）
+            c = charge.strip()
+            if c.endswith("罪"):
+                c = c[:-1]
+            # 从正例找
+            if c in self.pos_cases:
+                all_cases.extend(self.pos_cases[c])
+                all_embeddings.append(self.pos_embeddings[c])
+        
+        if not all_cases:
+            # 如果找不到， fallback 到所有候选罪名？那就把所有都加进来
+            logger.warning(f"No cases found for candidate charges: {candidate_changes}, falling back to all charges")
+            for charge in self.pos_charge_list:
+                all_cases.extend(self.pos_cases[charge])
+                all_embeddings.append(self.pos_embeddings[charge])
+        
+        # 拼接所有embedding
+        concatenated_emb = np.concatenate(all_embeddings, axis=0)
+        # L2归一化
+        target_embedding = target_embedding / np.linalg.norm(target_embedding)
+        concatenated_emb = concatenated_emb / np.linalg.norm(concatenated_emb, axis=1, keepdims=True)
+        
+        # 计算余弦相似度
+        similarities = concatenated_emb @ target_embedding
+        max_sim = similarities.max()
+        
+        # 固定k直接返回
+        if k is not None:
+            sorted_indices = np.argsort(-similarities)
+            top_indices = sorted_indices[:k]
+            top_cases = [all_cases[i] for i in top_indices]
+            return top_cases, max_sim, k
+        
+        # 粗筛出coarse_k候选
+        sorted_indices = np.argsort(-similarities)
+        coarse_k = min(self.config.coarse_k, len(sorted_indices))
+        top_indices = sorted_indices[:coarse_k]
+        coarse_cases = [all_cases[i] for i in top_indices]
+        
+        # 精筛：用自适应策略计算最终k
+        sorted_coarse = [(similarities[i], coarse_cases[i]) for i in top_indices]
+        sorted_coarse.sort(key=lambda x: -x[0])
+        sorted_similarities = np.array([x[0] for x in sorted_coarse])
+        sorted_cases = [x[1] for x in sorted_coarse]
+        
+        final_k = self.strategy.calculate_k(sorted_similarities, sorted_cases, target_fact)
+        final_cases = sorted_cases[:final_k]
+        
+        return final_cases, max_sim, final_k
+
+
+class HierarchicalAdaptiveRAGRetriever:
+    """分层自适应RAG检索器
+    正例和负例都是分层索引，先预测罪名，再检索
+    """
+    
+    def __init__(
+        self,
+        pos_retriever: HierarchicalEmbeddingRetriever,
+        neg_retriever: HierarchicalEmbeddingRetriever,
+    ):
+        self.pos_retriever = pos_retriever
+        self.neg_retriever = neg_retriever
+    
+    def retrieve(
+        self,
+        target_embedding: np.ndarray,
+        target_fact: str,
+        candidate_charges: List[str],
+        k_positive: Optional[int] = None,
+        k_negative: Optional[int] = None,
+    ) -> RetrievalResult:
+        # 检索正例
+        positive_examples, max_sim_pos, positive_k = self.pos_retriever.retrieve_topk(
+            target_embedding, target_fact, candidate_charges, k_positive
+        )
+        
+        # 检索负例：同样用预测的罪名过滤
+        negative_examples, max_sim_neg, negative_k = self.neg_retriever.retrieve_topk(
+            target_embedding, target_fact, candidate_charges, k_negative
+        )
+        
+        # 计算正例距离（保持接口兼容）
+        target_norm = target_embedding / np.linalg.norm(target_embedding)
+        # 收集所有正例embedding
+        pos_embs: List[np.ndarray] = []
+        for charge in candidate_charges:
+            c = charge.strip()
+            if c.endswith("罪"):
+                c = c[:-1]
+            if c in self.pos_retriever.pos_embeddings:
+                pos_embs.append(self.pos_retriever.pos_embeddings[c])
+        if pos_embs:
+            all_pos_embs = np.concatenate(pos_embs, axis=0)
+            distances = [1 - (embed @ target_norm) for embed in all_pos_embs[positive_examples]]
+        else:
+            distances = []
+        
+        return RetrievalResult(
+            positive_examples=positive_examples,
+            negative_examples=negative_examples,
+            positive_k=positive_k,
+            negative_k=negative_k,
+            max_sim_pos=max_sim_pos,
+            max_sim_neg=max_sim_neg,
+            distances=distances,
+        )
+
+
+def create_hierarchical_retriever_from_config(
+    config_dict: dict,
+    llm_client: Optional[Any] = None,
+    llm_model: Optional[str] = None,
+) -> HierarchicalAdaptiveRAGRetriever:
+    """从配置创建分层检索器"""
+    
+    def _parse_embedding_config(cfg: dict) -> HierarchicalRetrieverConfig:
+        adaptive_mode = cfg.get("adaptive_mode", "llm")
+        
+        static_config = None
+        if adaptive_mode == "static":
+            static_kwargs = cfg.get("static", {})
+            static_config = StaticAdaptiveKConfig(**static_kwargs)
+        
+        llm_config = None
+        if adaptive_mode == "llm":
+            llm_kwargs = cfg.get("llm", {})
+            llm_config = LLMVerifiedAdaptiveKConfig(**llm_kwargs)
+        
+        return HierarchicalRetrieverConfig(
+            index_root=cfg.get("index_root", "data/index_by_charge"),
+            embedding_model_name=cfg.get("embedding_model_name", "uer/sbert-base-chinese-nli"),
+            min_k=cfg.get("min_k", 1),
+            max_k=cfg.get("max_k", 5),
+            coarse_k=cfg.get("coarse_k", 10),
+            adaptive_mode=adaptive_mode,
+            static_config=static_config,
+            llm_config=llm_config,
+        )
+    
+    pos_dict = config_dict.get("positive", {})
+    neg_dict = config_dict.get("negative", {})
+    
+    pos_config = _parse_embedding_config(pos_dict)
+    neg_config = _parse_embedding_config(neg_dict)
+    
+    pos_retriever = HierarchicalEmbeddingRetriever(pos_config, llm_client, llm_model)
+    neg_retriever = HierarchicalEmbeddingRetriever(neg_config, llm_client, llm_model)
+    
+    return HierarchicalAdaptiveRAGRetriever(pos_retriever, neg_retriever)
+
+
 if __name__ == "__main__":
     # 简单测试
     print("EmbeddingRetriever 模块加载成功，支持两种自适应k策略：")
     print("  - static: 静态数学公式")
     print("  - llm: 大模型验证打分")
+    print("  - hierarchical: 分层检索（罪名过滤 → 粗筛 → 精筛）")
 

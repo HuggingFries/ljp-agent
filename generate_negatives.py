@@ -15,8 +15,32 @@ from typing import List, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
+import os
+import json
+from openai import OpenAI
 from agent import Case, DataLoader
-from main import load_api_config
+
+def load_api_config(config: dict):
+    """加载API配置
+    - base_url, model_name 直接从config读
+    - api_key 从环境变量读，env name 存在config里
+    """
+    api_config = config.get("api", {})
+    base_url = api_config.get("base_url")
+    api_key_env = api_config.get("api_key_env", "DEEPSEEK_API_KEY")
+    model_name = api_config.get("model_name")
+    
+    api_key = os.getenv(api_key_env)
+    
+    if not all([base_url, api_key, model_name]):
+        raise ValueError(
+            f"Missing API configuration:\n"
+            f"  - base_url: {base_url}\n"
+            f"  - api_key from env '{api_key_env}': {api_key is not None}\n"
+            f"  - model_name: {model_name}"
+        )
+    
+    return base_url, api_key, model_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,21 +95,34 @@ def generate_wrong_label(
 
 def main():
     parser = argparse.ArgumentParser(description='Generate negative examples for LJP')
+    parser.add_argument('--config', type=str, default='config.json',
+                       help='Configuration file path')
     parser.add_argument('--train-file', type=str, 
                        default='data/final_all_data/first_stage/train.json',
-                       help='CAIL2018 training json path')
-    parser.add_argument('--total-sample', type=int, default=500,
-                       help='Total number of samples to sample')
-    parser.add_argument('--neg-sample', type=int, default=250,
-                       help='Number of negative examples to generate')
+                       help='CAIL2018 training json path (overrides config)')
+    parser.add_argument('--total-sample', type=int, default=None,
+                       help='Total number of samples to sample (overrides config)')
+    parser.add_argument('--neg-sample', type=int, default=None,
+                       help='Number of negative examples to generate (overrides config)')
     parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
+                       help='Random seed (overrides config)')
     args = parser.parse_args()
     
-    random.seed(args.seed)
+    # 读取配置文件
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    # 命令行覆盖配置
+    eval_config = config.get("evaluation", {})
+    train_file = args.train_file or eval_config.get("test_file", "data/final_all_data/first_stage/train.json")
+    total_sample = args.total_sample or 500
+    neg_sample = args.neg_sample or 250
+    seed = args.seed or eval_config.get("seed", 42)
+    
+    random.seed(seed)
     
     # 加载API配置
-    base_url, api_key, model_name = load_api_config()
+    base_url, api_key, model_name = load_api_config(config)
     
     # 排除代理
     os.environ['HTTP_PROXY'] = ''
