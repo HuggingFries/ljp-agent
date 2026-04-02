@@ -88,15 +88,15 @@ class LJPAgentWithRAG:
         # 添加可选罪名列表（如果有）
         if self.charge_names and len(self.charge_names) > 0:
             prompt_parts.append("## 可选罪名列表（必须从这里选择，不能自己编造）")
-            prompt_parts.append(f"（共{len(self.charge_names)}个罪名，这里展示前100个）：")
-            prompt_parts.append(", ".join(self.charge_names[:100]) + "...")
+            prompt_parts.append(f"（共{len(self.charge_names)}个罪名）：")
+            prompt_parts.append(", ".join(self.charge_names))
             prompt_parts.append("")
         
         if self.article_names and len(self.article_names) > 0:
             prompt_parts.append("## 可选法条编号（必须从这里选择，不能自己编造）")
-            prompt_parts.append(f"（共{len(self.article_names)}个法条，这里展示前100个）：")
-            article_ids = [article for article in self.article_names[:100]]
-            prompt_parts.append(", ".join(article_ids) + "...")
+            prompt_parts.append(f"（共{len(self.article_names)}个法条）：")
+            article_ids = [article for article in self.article_names]
+            prompt_parts.append(", ".join(article_ids))
             prompt_parts.append("")
         
         # 添加正负案例
@@ -143,14 +143,15 @@ class LJPAgentWithRAG:
             List[str]: 候选罪名列表
         """
         n = min(5, total_charges)
+        logger.info(f"[步骤1] 罪名候选预测：根据案件事实预测top-{n}候选罪名")
+        
         prompt = f"""你是一个法律AI助手，需要根据案件事实预测可能涉及的罪名。
 
 ## 案件事实
 {target_fact}
 
 ## 可选罪名列表
-{', '.join(self.charge_names[:100])}
-... (总共 {total_charges} 个罪名，只列了前100个)
+{', '.join(self.charge_names)}
 
 ## 任务
 请从可选罪名列表中选出 {n} 个最可能涉及的罪名，直接输出罪名列表，不要输出其他内容。输出格式：
@@ -183,6 +184,7 @@ class LJPAgentWithRAG:
         # 截断到n个
         charges = charges[:n]
         
+        logger.info(f"[步骤1] 罪名候选预测完成，输出: {charges}")
         return charges
     
     def _default_system_prompt(self) -> str:
@@ -221,17 +223,20 @@ class LJPAgentWithRAG:
         如果是平面检索：直接检索 → 构建prompt → 预测
         支持自适应k：根据相似度自动决定检索数量
         """
+        logger.info("[工作流开始] 处理目标案件")
+        
         # 对目标案件编码
+        logger.info("[步骤0] 编码目标案件事实")
         target_embedding = embedding_model.encode(target_case.fact, normalize_embeddings=True)
         target_fact = target_case.fact
         
         # 自适应检索正负案例
         # 如果是分层检索，第一步需要先预测候选罪名
         if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'pos_charge_list'):
-            # 第一步：预测候选罪名
+            # 第一步：预测候选罪名（已经在_predict_candidate_charges里打日志了）
             candidate_charges = self._predict_candidate_charges(target_fact, len(self.charge_names))
-            logger.info(f"LLM predicted candidate charges: {candidate_charges}")
-            # 分层检索
+            # 分层检索正例负例
+            logger.info("[步骤2] 分层检索正负案例")
             retrieval_result = self.adaptive_retriever.retrieve(
                 target_embedding,
                 target_fact=target_fact,
@@ -241,19 +246,22 @@ class LJPAgentWithRAG:
             )
         else:
             # 普通平面检索
+            logger.info("[步骤1][平面检索] 直接从全库检索")
             retrieval_result = self.adaptive_retriever.retrieve(
                 target_embedding,
                 target_fact=target_fact,
                 k_positive=self.k_positive,
                 k_negative=self.k_negative
             )
+        
         positive_examples = retrieval_result.positive_examples
         negative_examples = retrieval_result.negative_examples
         
         # 日志记录本次检索k
         if self.k_positive is None and self.k_negative is None:
-            logger.info(f"Adaptive retrieval done: pos_k={retrieval_result.positive_k}, neg_k={retrieval_result.negative_k}, max_sim_pos={retrieval_result.max_sim_pos:.4f}, max_sim_neg={retrieval_result.max_sim_neg:.4f}")
+            logger.info(f"[步骤3] 自适应检索完成: pos_k={retrieval_result.positive_k}, neg_k={retrieval_result.negative_k}, max_sim_pos={retrieval_result.max_sim_pos:.4f}")
         
+        logger.info("[步骤4] 构建预测Prompt")
         prompt = self.build_prompt(target_case, positive_examples, negative_examples)
         
         response = self.client.chat.completions.create(

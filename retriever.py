@@ -11,6 +11,7 @@ Date: 2026-03-26
 """
 
 from typing import List, Tuple, Optional, Any, Protocol
+import os
 import numpy as np
 import json
 import logging
@@ -703,26 +704,44 @@ class HierarchicalEmbeddingRetriever:
         Returns:
             (top_cases, max_sim, final_k)
         """
+        logger.info(f"[分层检索] 第一层：根据候选罪名过滤范围，候选罪名={candidate_charges}")
+        
         # 收集所有候选罪名对应的案例和embedding
         all_cases: List[Case] = []
         all_embeddings: List[np.ndarray] = []
         
         for charge in candidate_charges:
-            # 格式化罪名（去掉罪后缀）
+            # 格式化罪名（去掉罪后缀），并且替换文件名特殊字符
             c = charge.strip()
             if c.endswith("罪"):
                 c = c[:-1]
-            # 从正例找
-            if c in self.pos_cases:
+            # 保存文件名时 / 被替换成 _，查找时也替换
+            c_safe = c.replace('/', '_')
+            # 从本分组找，先试安全名，找不到再试原名
+            if c_safe in self.pos_cases:
+                logger.info(f"[分层检索] 找到罪名 '{c}'，包含 {len(self.pos_cases[c_safe])} 个候选案例")
+                all_cases.extend(self.pos_cases[c_safe])
+                all_embeddings.append(self.pos_embeddings[c_safe])
+            elif c in self.pos_cases:
+                logger.info(f"[分层检索] 找到罪名 '{c}'，包含 {len(self.pos_cases[c])} 个候选案例")
                 all_cases.extend(self.pos_cases[c])
                 all_embeddings.append(self.pos_embeddings[c])
+            else:
+                logger.warning(f"[分层检索] 候选罪名 '{c}' 在索引中不存在，跳过")
         
         if not all_cases:
-            # 如果找不到， fallback 到所有候选罪名？那就把所有都加进来
-            logger.warning(f"No cases found for candidate charges: {candidate_changes}, falling back to all charges")
+            # 如果找不到， fallback 到所有罪名
+            logger.warning(f"[分层检索] 未找到匹配候选案例，回退到全量索引")
             for charge in self.pos_charge_list:
-                all_cases.extend(self.pos_cases[charge])
-                all_embeddings.append(self.pos_embeddings[charge])
+                if charge in self.pos_cases:
+                    all_cases.extend(self.pos_cases[charge])
+                    all_embeddings.append(self.pos_embeddings[charge])
+        
+        logger.info(f"[分层检索] 第一层过滤完成，剩余 {len(all_cases)} 个候选案例")
+        
+        if not all_cases:
+            logger.error(f"[分层检索] 回退后仍然没有找到任何案例，检查索引是否构建正确，返回空结果")
+            return [], 0.0, 0
         
         # 拼接所有embedding
         concatenated_emb = np.concatenate(all_embeddings, axis=0)
@@ -739,6 +758,7 @@ class HierarchicalEmbeddingRetriever:
             sorted_indices = np.argsort(-similarities)
             top_indices = sorted_indices[:k]
             top_cases = [all_cases[i] for i in top_indices]
+            logger.info(f"[分层检索] 固定k={k}，返回 {len(top_cases)} 个案例")
             return top_cases, max_sim, k
         
         # 粗筛出coarse_k候选
@@ -746,6 +766,7 @@ class HierarchicalEmbeddingRetriever:
         coarse_k = min(self.config.coarse_k, len(sorted_indices))
         top_indices = sorted_indices[:coarse_k]
         coarse_cases = [all_cases[i] for i in top_indices]
+        logger.info(f"[分层检索] 第二层：embedding粗筛，选出top-{coarse_k}候选")
         
         # 精筛：用自适应策略计算最终k
         sorted_coarse = [(similarities[i], coarse_cases[i]) for i in top_indices]
@@ -753,8 +774,11 @@ class HierarchicalEmbeddingRetriever:
         sorted_similarities = np.array([x[0] for x in sorted_coarse])
         sorted_cases = [x[1] for x in sorted_coarse]
         
+        logger.info(f"[分层检索] 第三层：自适应精筛，计算最终k")
         final_k = self.strategy.calculate_k(sorted_similarities, sorted_cases, target_fact)
         final_cases = sorted_cases[:final_k]
+        
+        logger.info(f"[分层检索] 完成，最终选出 {len(final_cases)} 个案例，最大相似度={max_sim:.4f}")
         
         return final_cases, max_sim, final_k
 

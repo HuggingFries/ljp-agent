@@ -100,8 +100,10 @@ def main():
     parser.add_argument('--train-file', type=str, 
                        default='data/final_all_data/first_stage/train.json',
                        help='CAIL2018 training json path (overrides config)')
+    parser.add_argument('--balanced-sample-file', type=str, default=None,
+                       help='Use pre-balanced sampled data instead of random sampling (from sample_balanced.py)')
     parser.add_argument('--total-sample', type=int, default=None,
-                       help='Total number of samples to sample (overrides config)')
+                       help='Total number of samples to sample (overrides config, only used when no balanced-sample-file)')
     parser.add_argument('--neg-sample', type=int, default=None,
                        help='Number of negative examples to generate (overrides config)')
     parser.add_argument('--seed', type=int, default=42,
@@ -115,8 +117,8 @@ def main():
     # 命令行覆盖配置
     eval_config = config.get("evaluation", {})
     train_file = args.train_file or eval_config.get("test_file", "data/final_all_data/first_stage/train.json")
-    total_sample = args.total_sample or 500
-    neg_sample = args.neg_sample or 250
+    total_sample = args.total_sample or eval_config.get("total_sample", 500)
+    neg_sample = args.neg_sample or eval_config.get("neg_sample", 250)
     seed = args.seed or eval_config.get("seed", 42)
     
     random.seed(seed)
@@ -130,17 +132,31 @@ def main():
     
     client = OpenAI(base_url=base_url, api_key=api_key)
     
-    # 加载训练数据
-    train_data = DataLoader.load_cail2018(args.train_file)
-    logger.info(f"Loaded {len(train_data)} training samples")
-    
-    # 随机采样
-    all_samples = random.sample(train_data, args.total_sample)
-    logger.info(f"Sampled {args.total_sample} total samples")
+    # 两种模式：
+    # 1. 使用预先均衡采样好的文件（推荐，已经保证罪名均衡覆盖）
+    # 2. 原始模式：从训练集随机采样（兼容旧用法）
+    if args.balanced_sample_file:
+        # 加载预先均衡采样好的数据
+        with open(args.balanced_sample_file, 'r', encoding='utf-8') as f:
+            all_samples = json.load(f)
+        logger.info(f"Loaded pre-balanced {len(all_samples)} samples from {args.balanced_sample_file}")
+        # 使用实际加载的数量，忽略命令行total_sample
+        total_sample = len(all_samples)
+        if neg_sample > total_sample:
+            logger.warning(f"neg_sample ({neg_sample}) > total samples ({total_sample}), clamping to {total_sample}")
+            neg_sample = total_sample
+    else:
+        # 原始模式：从完整训练集随机采样
+        train_data = DataLoader.load_cail2018(args.train_file)
+        logger.info(f"Loaded {len(train_data)} training samples")
+        # 随机采样
+        all_samples = random.sample(train_data, total_sample)
+        logger.info(f"Random sampled {total_sample} total samples")
     
     # 拆分：正样本和负样本
-    pos_samples = all_samples[:args.total_sample - args.neg_sample]
-    neg_samples_input = all_samples[args.total_sample - args.neg_sample:]
+    pos_count = total_sample - neg_sample
+    pos_samples = all_samples[:pos_count]
+    neg_samples_input = all_samples[pos_count:]
     logger.info(f"Positive samples: {len(pos_samples)}, Negative samples to generate: {len(neg_samples_input)}")
     
     # 保存正样本（原始标签）

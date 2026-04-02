@@ -36,6 +36,8 @@ from agent import Case, DataLoader, LJPAgentWithRAG, PredictionResult
 from retriever import (
     AdaptiveRAGRetriever,
     create_retriever_from_config,
+    HierarchicalAdaptiveRAGRetriever,
+    create_hierarchical_retriever_from_config,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -152,8 +154,11 @@ def load_rag_index(
     config: dict,
     llm_client=None,
     llm_model=None,
-) -> tuple[AdaptiveRAGRetriever, any]:
+) -> tuple[AdaptiveRAGRetriever | HierarchicalAdaptiveRAGRetriever, any]:
     """从配置加载RAG索引
+    支持两种模式：
+    - flat: 平面索引，所有案例放一起
+    - hierarchical: 分层索引，按罪名分组，先筛罪名再找相似
     
     Args:
         config: 全局配置字典
@@ -170,60 +175,86 @@ def load_rag_index(
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     from sentence_transformers import SentenceTransformer
     embedding_model = SentenceTransformer(embedding_model_name)
+    logger.info(f"[初始化] 加载Embedding模型完成: {embedding_model_name}")
     
-    # 从配置创建检索器
+    # 从配置读取检索模式
     retriever_config = config.get("retriever", {})
-    adaptive_retriever = create_retriever_from_config(
-        retriever_config,
-        llm_client=llm_client,
-        llm_model=llm_model,
-    )
+    retriever_mode = retriever_config.get("mode", "flat")
     
-    # 加载案例和预计算embeddings
-    pos_cases_path = os.path.join(index_dir, "pos_cases.json")
-    pos_index_path = os.path.join(index_dir, "pos_index.npy")
+    if retriever_mode == "flat":
+        # ========== 平面索引模式 ==========
+        logger.info("[初始化] 使用平面检索模式 (flat)")
+        adaptive_retriever = create_retriever_from_config(
+            retriever_config,
+            llm_client=llm_client,
+            llm_model=llm_model,
+        )
+        
+        # 加载案例和预计算embeddings
+        pos_cases_path = os.path.join(index_dir, "pos_cases.json")
+        pos_index_path = os.path.join(index_dir, "pos_index.npy")
+        
+        with open(pos_cases_path, 'r', encoding='utf-8') as f:
+            pos_cases_data = json.load(f)
+        
+        pos_cases = []
+        for item in pos_cases_data:
+            pos_cases.append(Case(
+                fact=item['fact'],
+                charges=item['charges'],
+                articles=item['articles'],
+                judgment='',
+                is_positive=True
+            ))
+        
+        import numpy as np
+        pos_embeddings = np.load(pos_index_path)
+        adaptive_retriever.pos_retriever.index(pos_cases, pos_embeddings)
+        
+        neg_cases_path = os.path.join(index_dir, "neg_cases.json")
+        neg_index_path = os.path.join(index_dir, "neg_index.npy")
+        
+        with open(neg_cases_path, 'r', encoding='utf-8') as f:
+            neg_cases_data = json.load(f)
+        
+        neg_cases = []
+        for item in neg_cases_data:
+            neg_cases.append(Case(
+                fact=item['fact'],
+                charges=item['charges'],
+                articles=item['articles'],
+                judgment='',
+                is_positive=False
+            ))
+        
+        neg_embeddings = np.load(neg_index_path)
+        adaptive_retriever.neg_retriever.index(neg_cases, neg_embeddings)
+        
+        # 日志
+        logger.info(f"[初始化][平面模式] 加载完成: 正例={len(pos_cases)}, 负例={len(neg_cases)}")
+        logger.info(f"[初始化][平面模式] 正例模式={adaptive_retriever.pos_retriever.config.adaptive_mode}, 负例模式={adaptive_retriever.neg_retriever.config.adaptive_mode}")
+        
+        return adaptive_retriever, embedding_model
     
-    with open(pos_cases_path, 'r', encoding='utf-8') as f:
-        pos_cases_data = json.load(f)
+    elif retriever_mode == "hierarchical":
+        # ========== 分层索引模式 ==========
+        logger.info("[初始化] 使用分层检索模式 (hierarchical)")
+        hierarchical_config = retriever_config.get("hierarchical", {})
+        adaptive_retriever = create_hierarchical_retriever_from_config(
+            hierarchical_config,
+            llm_client=llm_client,
+            llm_model=llm_model,
+        )
+        
+        # 分层索引已经在创建时加载完毕
+        pos_count = sum(len(v) for v in adaptive_retriever.pos_retriever.pos_cases.values())
+        neg_count = sum(len(v) for v in adaptive_retriever.neg_retriever.neg_cases.values())
+        logger.info(f"[初始化][分层模式] 加载完成: 正例={pos_count} ({len(adaptive_retriever.pos_retriever.pos_charge_list)} 个罪名), 负例={neg_count} ({len(adaptive_retriever.neg_retriever.pos_charge_list)} 个罪名)")
+        
+        return adaptive_retriever, embedding_model
     
-    pos_cases = []
-    for item in pos_cases_data:
-        pos_cases.append(Case(
-            fact=item['fact'],
-            charges=item['charges'],
-            articles=item['articles'],
-            judgment='',
-            is_positive=True
-        ))
-    
-    import numpy as np
-    pos_embeddings = np.load(pos_index_path)
-    adaptive_retriever.pos_retriever.index(pos_cases, pos_embeddings)
-    
-    neg_cases_path = os.path.join(index_dir, "neg_cases.json")
-    neg_index_path = os.path.join(index_dir, "neg_index.npy")
-    
-    with open(neg_cases_path, 'r', encoding='utf-8') as f:
-        neg_cases_data = json.load(f)
-    
-    neg_cases = []
-    for item in neg_cases_data:
-        neg_cases.append(Case(
-            fact=item['fact'],
-            charges=item['charges'],
-            articles=item['articles'],
-            judgment='',
-            is_positive=False
-        ))
-    
-    neg_embeddings = np.load(neg_index_path)
-    adaptive_retriever.neg_retriever.index(neg_cases, neg_embeddings)
-    
-    # 日志
-    logger.info(f"Loaded positive index: {len(pos_cases)} cases, mode={adaptive_retriever.pos_retriever.config.adaptive_mode}")
-    logger.info(f"Loaded negative index: {len(neg_cases)} cases, mode={adaptive_retriever.neg_retriever.config.adaptive_mode}")
-    
-    return adaptive_retriever, embedding_model
+    else:
+        raise ValueError(f"Unknown retriever mode: {retriever_mode}, expected 'flat' or 'hierarchical'")
 
 
 def load_api_config(config: dict):
