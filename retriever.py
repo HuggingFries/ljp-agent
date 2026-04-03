@@ -2,15 +2,14 @@
 正负案例检索器
 基于embedding的相似性检索，获取与目标案件相似正例和相似错例负例
 
-支持多种自适应k策略：
-- static: 传统静态数学公式计算，alpha缩放，可选归一化，保证分布均匀
-- llm: 大模型评估法律相关性，自决定k，只保留真正相关的案例
+只保留LLM驱动自适应k策略：
+- llm: 大模型评估法律相关性，迭代验证，自决定k，只保留真正相关的案例
 
 Author: Your Name
 Date: 2026-03-26
 """
 
-from typing import List, Tuple, Optional, Any, Protocol
+from typing import List, Tuple, Optional, Any, Protocol, Dict
 import os
 import numpy as np
 import json
@@ -42,60 +41,6 @@ class AdaptiveKStrategy(Protocol):
             int: 最终应该返回的k值，范围在[min_k, max_k]之间
         """
         ...
-
-
-@dataclass
-class StaticAdaptiveKConfig:
-    """静态数学公式自适应k配置
-    
-    Attributes:
-        min_k: 最小返回案例数，默认=1
-        max_k: 最大返回案例数，默认=5
-        alpha: 缩放系数，越大整体k越大。公式: k = round(min_k + (max_k - min_k) * (1 - sim_max) * alpha)，默认=1.0
-        normalize: 是否对sim_max做归一化，让k分布更均匀。如果数据集相似度分布偏移，开启后效果更好，默认=False
-        sim_min: 归一化用，所有top1相似度的最小值，None则自动计算，默认=None
-        sim_max: 归一化用，所有top1相似度的最大值，None则自动计算，默认=None
-    """
-    min_k: int = 1
-    max_k: int = 5
-    alpha: float = 1.0
-    normalize: bool = False
-    sim_min: Optional[float] = None
-    sim_max: Optional[float] = None
-
-
-class StaticAdaptiveKStrategy:
-    """静态数学公式自适应k
-    核心思想：sim_max越大（已经有高相似案例）→ k越小；sim_max越小 → k越大
-    """
-    
-    def __init__(self, config: StaticAdaptiveKConfig):
-        self.config = config
-        self._sim_min = config.sim_min
-        self._sim_max = config.sim_max
-    
-    def set_normalization_params(self, sim_min: float, sim_max: float):
-        """设置归一化参数，一般在构建索引后自动计算设置"""
-        self._sim_min = sim_min
-        self._sim_max = sim_max
-    
-    def calculate_k(
-        self,
-        similarities: np.ndarray,
-        sorted_cases: List[Case],
-        target_fact: str,
-    ) -> int:
-        max_sim = similarities.max()
-        
-        if self.config.normalize and self._sim_min is not None and self._sim_max is not None:
-            norm = (self._sim_max - max_sim) / (self._sim_max - self._sim_min)
-            norm = max(0.0, min(1.0, norm))
-        else:
-            norm = (1 - max_sim)
-        
-        k = round(self.config.min_k + (self.config.max_k - self.config.min_k) * norm * self.config.alpha)
-        k = max(self.config.min_k, min(self.config.max_k, k))
-        return k
 
 
 @dataclass
@@ -265,18 +210,14 @@ class EmbeddingRetrieverConfig:
     """Embedding检索器配置
     
     Attributes:
-        adaptive_mode: 自适应k模式，可选值: "static" | "llm"，默认="static"
-        static_config: static模式的配置，adaptive_mode="static"时生效
-        llm_config: llm模式的配置，adaptive_mode="llm"时生效
+        llm_config: llm模式的配置
     """
-    adaptive_mode: str = "static"  # "static" or "llm"
-    static_config: StaticAdaptiveKConfig = None
     llm_config: LLMVerifiedAdaptiveKConfig = None
 
 
 class EmbeddingRetriever:
     """
-    基于embedding的检索器，支持多种自适应k策略
+    基于embedding的检索器，只保留LLM验证自适应k策略
     正例库和负例库各自独立使用一个retriever
     """
     
@@ -290,9 +231,9 @@ class EmbeddingRetriever:
         """
         Args:
             embedding_model: sentence-transformers编码模型，None表示预编码embedding已经提供
-            config: 检索器配置，包含自适应模式选择
-            llm_client: 大模型客户端，adaptive_mode="llm"时需要
-            llm_model: 大模型名称，adaptive_mode="llm"时需要
+            config: 检索器配置
+            llm_client: 大模型客户端，必须提供
+            llm_model: 大模型名称，必须提供
         """
         self.embedding_model = embedding_model
         self.case_embeddings: Optional[np.ndarray] = None
@@ -304,19 +245,12 @@ class EmbeddingRetriever:
         
         self.config = config
         
-        # 根据模式初始化策略
-        if config.adaptive_mode == "static":
-            if config.static_config is None:
-                config.static_config = StaticAdaptiveKConfig()
-            self.strategy: AdaptiveKStrategy = StaticAdaptiveKStrategy(config.static_config)
-        elif config.adaptive_mode == "llm":
-            if config.llm_config is None:
-                config.llm_config = LLMVerifiedAdaptiveKConfig()
-            if llm_client is None or llm_model is None:
-                raise ValueError("LLM mode requires llm_client and llm_model")
-            self.strategy: AdaptiveKStrategy = LLMVerifiedAdaptiveKStrategy(config.llm_config, llm_client, llm_model)
-        else:
-            raise ValueError(f"Unknown adaptive_mode: {config.adaptive_mode}, expected 'static' or 'llm'")
+        # 总是使用LLM验证策略
+        if config.llm_config is None:
+            config.llm_config = LLMVerifiedAdaptiveKConfig()
+        if llm_client is None or llm_model is None:
+            raise ValueError("LLM mode requires llm_client and llm_model")
+        self.strategy: AdaptiveKStrategy = LLMVerifiedAdaptiveKStrategy(config.llm_config, llm_client, llm_model)
     
     def index(self, cases: List[Case], embeddings: Optional[np.ndarray] = None):
         """建立索引
@@ -339,29 +273,6 @@ class EmbeddingRetriever:
         # L2归一化，方便余弦相似度计算
         norm = np.linalg.norm(self.case_embeddings, axis=1, keepdims=True)
         self.case_embeddings = self.case_embeddings / norm
-        
-        # 如果是static模式且开启归一化，自动计算sim_min/sim_max
-        if (
-            self.config.adaptive_mode == "static"
-            and self.config.static_config is not None
-            and self.config.static_config.normalize
-        ):
-            static_config = self.config.static_config
-            if (static_config.sim_min is None or static_config.sim_max is None) and self.case_embeddings is not None:
-                norm_emb = self.case_embeddings
-                sim_matrix = norm_emb @ norm_emb.T
-                sim_max_list = []
-                for i in range(sim_matrix.shape[0]):
-                    row = sim_matrix[i].copy()
-                    row[i] = 0
-                    sim_max_list.append(row.max())
-                auto_sim_min = np.min(sim_max_list)
-                auto_sim_max = np.max(sim_max_list)
-                sim_min = static_config.sim_min if static_config.sim_min is not None else float(auto_sim_min)
-                sim_max = static_config.sim_max if static_config.sim_max is not None else float(auto_sim_max)
-                if isinstance(self.strategy, StaticAdaptiveKStrategy):
-                    self.strategy.set_normalization_params(sim_min, sim_max)
-                logger.info(f"Auto computed normalization params: sim_min={sim_min:.4f}, sim_max={sim_max:.4f}")
     
     def retrieve_topk(
         self, 
@@ -404,7 +315,7 @@ class EmbeddingRetriever:
         sorted_indices = np.argsort(-similarities)
         sorted_cases = [self.cases[i] for i in sorted_indices]
         
-        # 使用策略计算自适应k
+        # 使用LLM策略计算自适应k
         k = self.strategy.calculate_k(similarities, sorted_cases, target_fact)
         
         # 取前k个
@@ -439,7 +350,7 @@ class RetrievalResult:
 
 class AdaptiveRAGRetriever:
     """
-    完整的自适应RAG检索器
+    完整的自适应RAG检索器（只保留LLM自适应）
     包含独立的正例检索器和负例检索器，各自计算自适应k
     """
     
@@ -506,33 +417,21 @@ def create_retriever_from_config(
     llm_client: Optional[Any] = None,
     llm_model: Optional[str] = None,
 ) -> AdaptiveRAGRetriever:
-    """根据配置字典创建检索器
+    """根据配置字典创建检索器（只保留LLM模式）
     
     Args:
         config_dict: 配置字典，从json加载
-        llm_client: 大模型客户端，llm模式需要
-        llm_model: 大模型名称，llm模式需要
+        llm_client: 大模型客户端，必须提供
+        llm_model: 大模型名称，必须提供
     
     Returns:
         AdaptiveRAGRetriever: 配置好的检索器
     """
     def _parse_embedding_config(cfg: dict) -> EmbeddingRetrieverConfig:
         """解析单个检索器配置"""
-        adaptive_mode = cfg.get("adaptive_mode", "static")
-        
-        static_config = None
-        if adaptive_mode == "static":
-            static_kwargs = cfg.get("static", {})
-            static_config = StaticAdaptiveKConfig(**static_kwargs)
-        
-        llm_config = None
-        if adaptive_mode == "llm":
-            llm_kwargs = cfg.get("llm", {})
-            llm_config = LLMVerifiedAdaptiveKConfig(**llm_kwargs)
-        
+        llm_kwargs = cfg.get("llm", {})
+        llm_config = LLMVerifiedAdaptiveKConfig(**llm_kwargs)
         return EmbeddingRetrieverConfig(
-            adaptive_mode=adaptive_mode,
-            static_config=static_config,
             llm_config=llm_config,
         )
     
@@ -571,8 +470,6 @@ class HierarchicalRetrieverConfig:
         min_k: 最少返回案例数
         max_k: 最多返回案例数
         coarse_k: 语义粗筛返回多少候选给LLM验证
-        adaptive_mode: 最终精筛的自适应模式: "static" | "llm"
-        static_config: static模式配置
         llm_config: llm模式配置
     """
     index_root: str = "data/index_by_charge"
@@ -580,8 +477,6 @@ class HierarchicalRetrieverConfig:
     min_k: int = 1
     max_k: int = 5
     coarse_k: int = 10
-    adaptive_mode: str = "llm"
-    static_config: StaticAdaptiveKConfig = None
     llm_config: LLMVerifiedAdaptiveKConfig = None
 
 
@@ -610,27 +505,17 @@ class HierarchicalEmbeddingRetriever:
         self.neg_charge_list = self._load_charge_list("neg")
         
         # 预加载所有案例和embeddings到内存（数据集小，没问题）
-        self.pos_cases: Dict[str, List[Case]] = {}
-        self.pos_embeddings: Dict[str, np.ndarray] = {}
-        for charge in self.pos_charge_list:
-            cases, embeddings = self._load_charge_index("pos", charge)
-            self.pos_cases[charge] = cases
-            self.pos_embeddings[charge] = embeddings
+        # 一次性加载所有，按罪名逻辑分组，不用每个罪名一个文件夹
+        self.pos_cases, self.pos_embeddings = self._load_charge_index("pos")
+        self.neg_cases, self.neg_embeddings = self._load_charge_index("neg")
         
-        self.neg_cases: Dict[str, List[Case]] = {}
-        self.neg_embeddings: Dict[str, np.ndarray] = {}
-        for charge in self.neg_charge_list:
-            cases, embeddings = self._load_charge_index("neg", charge)
-            self.neg_cases[charge] = cases
-            self.neg_embeddings[charge] = embeddings
-        
-        # 初始化精筛策略
+        # 初始化精筛策略（始终LLM）
         self._init_strategy()
         
         logger.info(f"Loaded hierarchical retriever:")
         logger.info(f"  Positive charges: {len(self.pos_charge_list)}, total cases: {sum(len(v) for v in self.pos_cases.values())}")
         logger.info(f"  Negative charges: {len(self.neg_charge_list)}, total cases: {sum(len(v) for v in self.neg_cases.values())}")
-        logger.info(f"  Fine adaptive mode: {config.adaptive_mode}, coarse_k={config.coarse_k}")
+        logger.info(f"  Fine adaptive mode: llm, coarse_k={config.coarse_k}")
     
     def _load_charge_list(self, prefix: str) -> List[str]:
         """加载罪名列表"""
@@ -641,52 +526,67 @@ class HierarchicalEmbeddingRetriever:
         with open(charge_list_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    def _load_charge_index(self, prefix: str, charge: str) -> Tuple[List[Case], np.ndarray]:
-        """加载单个罪名的索引"""
-        safe_charge = charge.replace('/', '_')
-        charge_dir = os.path.join(self.config.index_root, prefix, safe_charge)
-        cases_path = os.path.join(charge_dir, "cases.json")
-        index_path = os.path.join(charge_dir, "index.npy")
+    def _load_charge_index(self, prefix: str) -> Tuple[Dict[str, List[Case]], Dict[str, np.ndarray]]:
+        """加载所有罪名的索引（一次性加载，逻辑分组）
+        Returns:
+            (cases_map, embeddings_map): 按罪名分组的案例和embedding
+        """
+        # 加载偏移信息
+        offsets_path = os.path.join(self.config.index_root, f"{prefix}_charge_offsets.json")
+        cases_path = os.path.join(self.config.index_root, f"{prefix}_cases.json")
+        index_path = os.path.join(self.config.index_root, f"{prefix}_index.npy")
+        
+        with open(offsets_path, 'r', encoding='utf-8') as f:
+            charge_offsets = json.load(f)
         
         with open(cases_path, 'r', encoding='utf-8') as f:
-            cases_data = json.load(f)
+            all_cases_data = json.load(f)
         
-        cases: List[Case] = []
-        for item in cases_data:
-            cases.append(Case(
-                fact=item['fact'],
-                charges=item['charges'],
-                articles=item['articles'],
-                judgment='',
-                is_positive=item['is_positive'],
-            ))
+        all_embeddings = np.load(index_path)
         
-        embeddings = np.load(index_path)
-        return cases, embeddings
+        # 按罪名分组
+        cases_map: Dict[str, List[Case]] = {}
+        embeddings_map: Dict[str, np.ndarray] = {}
+        
+        for charge, offset_info in charge_offsets.items():
+            start = offset_info['start']
+            count = offset_info['count']
+            end = start + count
+            
+            # 取出该罪名的案例
+            cases_data = all_cases_data[start:end]
+            cases: List[Case] = []
+            for item in cases_data:
+                cases.append(Case(
+                    fact=item['fact'],
+                    charges=item['charges'],
+                    articles=item['articles'],
+                    judgment='',
+                    is_positive=item['is_positive'],
+                ))
+            
+            # 取出该罪名的embeddings
+            embeddings = all_embeddings[start:end]
+            
+            cases_map[charge] = cases
+            embeddings_map[charge] = embeddings
+        
+        logger.info(f"Loaded {len(cases_map)} charges, {len(all_cases_data)} total {prefix} cases")
+        return cases_map, embeddings_map
     
     def _init_strategy(self):
-        """初始化精筛策略"""
+        """初始化精筛策略（始终LLM）"""
         config = self.config
-        if config.adaptive_mode == "static":
-            if config.static_config is None:
-                config.static_config = StaticAdaptiveKConfig(
-                    min_k=config.min_k,
-                    max_k=config.max_k,
-                )
-            self.strategy: AdaptiveKStrategy = StaticAdaptiveKStrategy(config.static_config)
-        elif config.adaptive_mode == "llm":
-            if config.llm_config is None:
-                config.llm_config = LLMVerifiedAdaptiveKConfig(
-                    min_k=config.min_k,
-                    max_k=config.max_k,
-                )
-            self.strategy: AdaptiveKStrategy = LLMVerifiedAdaptiveKStrategy(
-                config.llm_config,
-                self.llm_client,
-                self.llm_model,
+        if config.llm_config is None:
+            config.llm_config = LLMVerifiedAdaptiveKConfig(
+                min_k=config.min_k,
+                max_k=config.max_k,
             )
-        else:
-            raise ValueError(f"Unknown adaptive_mode: {config.adaptive_mode}")
+        self.strategy: AdaptiveKStrategy = LLMVerifiedAdaptiveKStrategy(
+            config.llm_config,
+            self.llm_client,
+            self.llm_model,
+        )
     
     def retrieve_topk(
         self,
@@ -765,11 +665,13 @@ class HierarchicalEmbeddingRetriever:
         sorted_indices = np.argsort(-similarities)
         coarse_k = min(self.config.coarse_k, len(sorted_indices))
         top_indices = sorted_indices[:coarse_k]
-        coarse_cases = [all_cases[i] for i in top_indices]
         logger.info(f"[分层检索] 第二层：embedding粗筛，选出top-{coarse_k}候选")
         
         # 精筛：用自适应策略计算最终k
-        sorted_coarse = [(similarities[i], coarse_cases[i]) for i in top_indices]
+        # 注意：top_indices里存的是原始索引，直接用原始索引取similarities和cases
+        sorted_coarse = [(similarities[idx], all_cases[idx]) for idx in top_indices]
+        # 已经按相似度从大到小排序了，因为sorted_indices就是排序后的
+        # 这里再sort一遍是冗余，但不影响，保证顺序正确
         sorted_coarse.sort(key=lambda x: -x[0])
         sorted_similarities = np.array([x[0] for x in sorted_coarse])
         sorted_cases = [x[1] for x in sorted_coarse]
@@ -849,20 +751,11 @@ def create_hierarchical_retriever_from_config(
     llm_client: Optional[Any] = None,
     llm_model: Optional[str] = None,
 ) -> HierarchicalAdaptiveRAGRetriever:
-    """从配置创建分层检索器"""
+    """从配置创建分层检索器（只保留LLM模式）"""
     
     def _parse_embedding_config(cfg: dict) -> HierarchicalRetrieverConfig:
-        adaptive_mode = cfg.get("adaptive_mode", "llm")
-        
-        static_config = None
-        if adaptive_mode == "static":
-            static_kwargs = cfg.get("static", {})
-            static_config = StaticAdaptiveKConfig(**static_kwargs)
-        
-        llm_config = None
-        if adaptive_mode == "llm":
-            llm_kwargs = cfg.get("llm", {})
-            llm_config = LLMVerifiedAdaptiveKConfig(**llm_kwargs)
+        llm_kwargs = cfg.get("llm", {})
+        llm_config = LLMVerifiedAdaptiveKConfig(**llm_kwargs)
         
         return HierarchicalRetrieverConfig(
             index_root=cfg.get("index_root", "data/index_by_charge"),
@@ -870,8 +763,6 @@ def create_hierarchical_retriever_from_config(
             min_k=cfg.get("min_k", 1),
             max_k=cfg.get("max_k", 5),
             coarse_k=cfg.get("coarse_k", 10),
-            adaptive_mode=adaptive_mode,
-            static_config=static_config,
             llm_config=llm_config,
         )
     
@@ -889,8 +780,6 @@ def create_hierarchical_retriever_from_config(
 
 if __name__ == "__main__":
     # 简单测试
-    print("EmbeddingRetriever 模块加载成功，支持两种自适应k策略：")
-    print("  - static: 静态数学公式")
-    print("  - llm: 大模型验证打分")
+    print("EmbeddingRetriever 模块加载成功，只保留LLM驱动自适应k策略：")
+    print("  - llm: 大模型验证打分迭代")
     print("  - hierarchical: 分层检索（罪名过滤 → 粗筛 → 精筛）")
-

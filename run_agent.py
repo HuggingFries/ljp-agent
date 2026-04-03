@@ -369,9 +369,7 @@ def main():
         
         print("\n" + "="*60)
         if args.k_positive is None and args.k_negative is None:
-            pos_mode = adaptive_retriever.pos_retriever.config.adaptive_mode
-            neg_mode = adaptive_retriever.neg_retriever.config.adaptive_mode
-            print(f"=== Batch Evaluation: Adaptive k (pos_mode={pos_mode}, neg_mode={neg_mode}) ===")
+            print(f"=== Batch Evaluation: Adaptive k (LLM-verified) ===")
         else:
             print(f"=== Batch Evaluation: Fixed k (pos={args.k_positive}, neg={args.k_negative}) ===")
         print("="*60)
@@ -407,10 +405,9 @@ def main():
         # 文件名
         if args.output is None:
             if args.k_positive is None and args.k_negative is None:
-                pos_mode = adaptive_retriever.pos_retriever.config.adaptive_mode
                 output_file = os.path.join(
                     "results", 
-                    f"agent_s{seed}_n{args.max_samples}_{pos_mode}.json"
+                    f"agent_s{seed}_n{args.max_samples}_llm-adaptive.json"
                 )
             else:
                 output_file = os.path.join(

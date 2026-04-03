@@ -4,8 +4,8 @@
 2. hierarchical: 分层索引，按罪名分组存储，检索时先筛罪名再找相似
 
 分层索引构建流程：
-- 正例索引：data/sampled_positives.json → data/index_by_charge/{charge_name}/{pos/neg}_*.json
-- 每个罪名单独保存embedding和cases，检索时只加载命中罪名的案例
+- 所有案例保存在同一个文件里，用charge分组标记，逻辑分层而非物理分层
+- 加载时一次性读入所有案例，检索第一步根据候选罪名过滤范围，再找相似
 """
 
 import os
@@ -115,44 +115,68 @@ def save_hierarchical_index(
     output_root: str,
     prefix: str,  # "pos" or "neg"
 ):
-    """保存分层索引：每个罪名一个子目录，存cases和embeddings"""
+    """保存分层索引：统一保存在几个文件中，逻辑分组
+    - {prefix}_cases.json: 所有案例列表，每个案例带charge标记
+    - {prefix}_index.npy: 所有embeddings拼接在一起
+    - {prefix}_charge_offsets.json: 每个罪名在大数组中的起始偏移和长度
+    - {prefix}_charge_list.json: 所有罪名列表
+    """
     os.makedirs(output_root, exist_ok=True)
     
-    # 保存罪名列表
+    # 收集所有案例，记录每个罪名的偏移
+    all_cases = []
+    all_embeddings = []
+    charge_offsets = {}
+    current_offset = 0
+    
+    # 按罪名顺序拼接
     all_charges = list(charge_map.keys())
     all_charges.sort()
+    
+    for charge in all_charges:
+        cases = charge_map[charge]
+        embeddings = embeddings_map[charge]
+        n = len(cases)
+        
+        # 记录偏移信息
+        charge_offsets[charge] = {
+            "start": current_offset,
+            "count": n
+        }
+        
+        # 添加到总列表
+        all_cases.extend([{
+            "fact": case.fact,
+            "charges": case.charges,
+            "articles": case.articles,
+            "is_positive": case.is_positive,
+            "charge_group": charge
+        } for case in cases])
+        
+        all_embeddings.append(embeddings)
+        current_offset += n
+    
+    # 拼接所有embeddings
+    concatenated = np.concatenate(all_embeddings, axis=0)
+    
+    # 保存罪名列表
     with open(os.path.join(output_root, f"{prefix}_charge_list.json"), 'w', encoding='utf-8') as f:
         json.dump(all_charges, f, ensure_ascii=False, indent=2)
     
-    # 每个罪名单独保存
-    total_cases = 0
-    for charge in all_charges:
-        charge_dir = os.path.join(output_root, prefix, charge.replace('/', '_'))
-        os.makedirs(charge_dir, exist_ok=True)
-        
-        cases = charge_map[charge]
-        embeddings = embeddings_map[charge]
-        
-        # 保存cases
-        case_list = []
-        for case in cases:
-            case_list.append({
-                "fact": case.fact,
-                "charges": case.charges,
-                "articles": case.articles,
-                "is_positive": case.is_positive
-            })
-        
-        with open(os.path.join(charge_dir, "cases.json"), 'w', encoding='utf-8') as f:
-            json.dump(case_list, f, indent=2, ensure_ascii=False)
-        
-        # 保存embeddings
-        np.save(os.path.join(charge_dir, "index.npy"), embeddings)
-        
-        total_cases += len(cases)
-        logger.debug(f"Saved {len(cases)} cases for charge '{charge}'")
+    # 保存偏移信息
+    with open(os.path.join(output_root, f"{prefix}_charge_offsets.json"), 'w', encoding='utf-8') as f:
+        json.dump(charge_offsets, f, ensure_ascii=False, indent=2)
     
-    logger.info(f"Saved hierarchical {prefix} index: {len(charge_map)} charges, {total_cases} total cases")
+    # 保存所有案例
+    with open(os.path.join(output_root, f"{prefix}_cases.json"), 'w', encoding='utf-8') as f:
+        json.dump(all_cases, f, indent=2, ensure_ascii=False)
+    
+    # 保存所有embeddings
+    np.save(os.path.join(output_root, f"{prefix}_index.npy"), concatenated)
+    
+    total_cases = len(all_cases)
+    logger.info(f"Saved hierarchical {prefix} index: {len(all_charges)} charges, {total_cases} total cases")
+    logger.info(f"  Files: {prefix}_charge_list.json, {prefix}_charge_offsets.json, {prefix}_cases.json, {prefix}_index.npy")
 
 
 def save_flat_index(cases: List[Case], embeddings: np.ndarray, output_dir: str, prefix: str):
@@ -183,7 +207,7 @@ def main():
     parser.add_argument('--config', type=str, default='config.json',
                        help='Configuration file path')
     parser.add_argument('--mode', type=str, default='hierarchical', choices=['flat', 'hierarchical'],
-                       help='Index mode: flat=all in one, hierarchical=group by charge')
+                       help='Index mode: flat=all in one, hierarchical=group by charge (logical grouping)')
     parser.add_argument('--pos-input', type=str, default='data/sampled_positives.json',
                        help='Input positive samples json')
     parser.add_argument('--neg-input', type=str, default='data/generated_negatives.json',
@@ -223,7 +247,7 @@ def main():
         logger.info(f"Negative index: {output_dir}/neg_cases.json + neg_index.npy")
     
     else:
-        # ========== 分层索引 ==========
+        # ========== 分层索引（逻辑分组，统一存储） ==========
         # 处理正例
         pos_cases = load_positives(args.pos_input)
         pos_charge_map = group_cases_by_charge(pos_cases, is_negative=False)
@@ -244,15 +268,17 @@ def main():
             logger.info(f"Encoding negative cases for charge: {charge} ({len(cases)} cases)")
             neg_embeddings_map[charge] = encode_cases(cases, model)
         
-        # 保存索引
-        pos_output_root = os.path.join(output_dir, "index_by_charge", "pos")
-        save_hierarchical_index(pos_charge_map, pos_embeddings_map, os.path.join(output_dir, "index_by_charge"), "pos")
-        save_hierarchical_index(neg_charge_map, neg_embeddings_map, os.path.join(output_dir, "index_by_charge"), "neg")
+        # 保存索引（统一文件）
+        hierarchical_root = os.path.join(output_dir, "index_by_charge")
+        save_hierarchical_index(pos_charge_map, pos_embeddings_map, hierarchical_root, "pos")
+        save_hierarchical_index(neg_charge_map, neg_embeddings_map, hierarchical_root, "neg")
         
-        logger.info("All done! Hierarchical index built successfully.")
-        logger.info(f"Index root: {os.path.join(output_dir, 'index_by_charge')}")
-        logger.info(f"  ├─ pos/: {len(pos_charge_map)} charges")
-        logger.info(f"  └─ neg/: {len(neg_charge_map)} charges")
+        logger.info("All done! Hierarchical index (logical grouping) built successfully.")
+        logger.info(f"Index root: {hierarchical_root}")
+        logger.info(f"  ├─ pos_charge_list.json    : 所有正例罪名列表")
+        logger.info(f"  ├─ pos_charge_offsets.json: 每个罪名偏移信息")
+        logger.info(f"  ├─ pos_cases.json         : 所有正例案例")
+        logger.info(f"  └─ pos_index.npy          : 所有正例embeddings")
 
 
 if __name__ == "__main__":
