@@ -182,7 +182,7 @@ def main():
     parser = argparse.ArgumentParser(description='Build embedding index, support flat/hierarchical')
     parser.add_argument('--config', type=str, default='config.json',
                        help='Configuration file path')
-    parser.add_argument('--mode', type=str, default='flat', choices=['flat', 'hierarchical'],
+    parser.add_argument('--mode', type=str, default='hierarchical', choices=['flat', 'hierarchical'],
                        help='Index mode: flat=all in one, hierarchical=group by charge')
     parser.add_argument('--pos-input', type=str, default='data/sampled_positives.json',
                        help='Input positive samples json')

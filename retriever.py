@@ -816,17 +816,20 @@ class HierarchicalAdaptiveRAGRetriever:
         
         # 计算正例距离（保持接口兼容）
         target_norm = target_embedding / np.linalg.norm(target_embedding)
-        # 收集所有正例embedding
-        pos_embs: List[np.ndarray] = []
-        for charge in candidate_charges:
-            c = charge.strip()
-            if c.endswith("罪"):
-                c = c[:-1]
-            if c in self.pos_retriever.pos_embeddings:
-                pos_embs.append(self.pos_retriever.pos_embeddings[c])
-        if pos_embs:
-            all_pos_embs = np.concatenate(pos_embs, axis=0)
-            distances = [1 - (embed @ target_norm) for embed in all_pos_embs[positive_examples]]
+        # 收集所有分层索引中的正例，找到正确索引
+        if len(positive_examples) > 0:
+            all_pos_cases = []
+            all_pos_embs_list = []
+            for charge in self.pos_retriever.pos_charge_list:
+                if charge in self.pos_retriever.pos_cases:
+                    all_pos_cases.extend(self.pos_retriever.pos_cases[charge])
+                    all_pos_embs_list.append(self.pos_retriever.pos_embeddings[charge])
+            all_pos_embs = np.concatenate(all_pos_embs_list, axis=0)
+            distances = []
+            for case in positive_examples:
+                idx = all_pos_cases.index(case)
+                embed = all_pos_embs[idx]
+                distances.append(1 - (embed @ target_norm))
         else:
             distances = []
         
