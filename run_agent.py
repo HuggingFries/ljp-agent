@@ -102,13 +102,34 @@ def evaluate_batch(
             detail["predicted_articles"] = list(pred_articles)
             detail["predicted_judgment"] = result.predicted_judgment
             
-            # 记录自适应信息
+            # 记录自适应信息和选中的案例（方便检查）
             if hasattr(result, 'retrieval_info'):
                 detail["adaptive_k"] = {
                     "positive_k": result.retrieval_info.positive_k,
                     "negative_k": result.retrieval_info.negative_k,
                     "max_sim_pos": float(result.retrieval_info.max_sim_pos),
                     "max_sim_neg": float(result.retrieval_info.max_sim_neg),
+                }
+                # 保存选中的正负案例完整信息
+                detail["retrieved_examples"] = {
+                    "positive": [
+                        {
+                            "fact": case.fact,
+                            "charges": case.charges,
+                            "articles": case.articles,
+                            "is_positive": case.is_positive,
+                        }
+                        for case in result.retrieval_info.positive_examples
+                    ],
+                    "negative": [
+                        {
+                            "fact": case.fact,
+                            "charges": case.charges,
+                            "articles": case.articles,
+                            "is_positive": case.is_positive,
+                        }
+                        for case in result.retrieval_info.negative_examples
+                    ],
                 }
             
             # 统计TP/FP/FN
@@ -295,6 +316,8 @@ def main():
     parser.add_argument('--embedding-model', type=str, default=None, help='embedding模型名称，覆盖配置文件')
     # 输出
     parser.add_argument('--output', type=str, default=None, help='输出结果到json文件')
+    # 检索模式（覆盖配置文件）
+    parser.add_argument('--mode', type=str, default=None, help='检索模式: flat / hierarchical，覆盖配置文件')
     args = parser.parse_args()
     
     # 读取配置文件
@@ -314,6 +337,9 @@ def main():
         config.setdefault("index", {})["index_dir"] = args.index_dir
     if args.embedding_model is not None:
         config.setdefault("index", {})["embedding_model"] = args.embedding_model
+    # 覆盖检索模式
+    if args.mode is not None:
+        config.setdefault("retriever", {})["mode"] = args.mode
     
     # 加载RAG索引（如果是llm模式，需要传入llm_client）
     from openai import OpenAI
@@ -395,17 +421,18 @@ def main():
         
         # 保存结果
         os.makedirs("results", exist_ok=True)
-        # 文件名
+        # 文件名：自动区分检索模式和k策略
+        retriever_mode = config.get("retriever", {}).get("mode", "flat")
         if args.output is None:
             if args.k_positive is None and args.k_negative is None:
                 output_file = os.path.join(
                     "results", 
-                    f"agent_s{seed}_n{args.max_samples}_llm-adaptive.json"
+                    f"{retriever_mode}_agent_s{seed}_n{args.max_samples}_llm-adaptive.json"
                 )
             else:
                 output_file = os.path.join(
                     "results", 
-                    f"agent_s{seed}_n{args.max_samples}_fixed_pos{args.k_positive}_neg{args.k_negative}.json"
+                    f"{retriever_mode}_agent_s{seed}_n{args.max_samples}_fixed_pos{args.k_positive}_neg{args.k_negative}.json"
                 )
         else:
             output_file = args.output
@@ -476,16 +503,33 @@ def main():
             print("\n" + "="*60)
             print("=== Prediction Result ===")
             print("="*60)
-            print(f"Predicted Charges: {', '.join(result.predicted_charges)}")
+            
+            print(f"\nPredicted Charges: {', '.join(result.predicted_charges)}")
             print(f"Predicted Articles: {', '.join(result.predicted_articles)}")
+            
             print("\nPredicted Judgment:")
             print(result.predicted_judgment)
+            print()
             
             if hasattr(result, 'retrieval_info'):
-                print("\n" + "-"*60)
+                print("-"*60)
                 print(f"Adaptive Retrieval Info:")
-                print(f"  Positive k: {result.retrieval_info.positive_k} (max_sim={result.retrieval_info.max_sim_pos:.4f})")
-                print(f"  Negative k: {result.retrieval_info.negative_k} (max_sim={result.retrieval_info.max_sim_neg:.4f})")
+                print(f"  Positive k = {result.retrieval_info.positive_k}  |  Max similarity = {result.retrieval_info.max_sim_pos:.4f}")
+                print(f"  Negative k = {result.retrieval_info.negative_k}  |  Max similarity = {result.retrieval_info.max_sim_neg:.4f}")
+                print()
+            
+                # 打印检索到的案例摘要，方便快速检查
+                print("Retrieved Positive Examples:")
+                for i, case in enumerate(result.retrieval_info.positive_examples, 1):
+                    fact_short = case.fact[:100] + "..." if len(case.fact) > 100 else case.fact
+                    print(f"  [{i}] Charges: {', '.join(case.charges)} | Fact: {fact_short}")
+                print()
+                if result.retrieval_info.negative_examples:
+                    print("Retrieved Negative Examples:")
+                    for i, case in enumerate(result.retrieval_info.negative_examples, 1):
+                        fact_short = case.fact[:100] + "..." if len(case.fact) > 100 else case.fact
+                        print(f"  [{i}] Charges: {', '.join(case.charges)} | Fact: {fact_short}")
+                    print()
             
             print("="*60)
             
@@ -503,9 +547,31 @@ def main():
                         "max_sim_neg": float(result.retrieval_info.max_sim_neg),
                     } if hasattr(result, 'retrieval_info') else None,
                 }
+                # 保存检索到的完整案例信息方便检查
+                if hasattr(result, 'retrieval_info'):
+                    output["retrieved_examples"] = {
+                        "positive": [
+                            {
+                                "fact": case.fact,
+                                "charges": case.charges,
+                                "articles": case.articles,
+                                "is_positive": case.is_positive,
+                            }
+                            for case in result.retrieval_info.positive_examples
+                        ],
+                        "negative": [
+                            {
+                                "fact": case.fact,
+                                "charges": case.charges,
+                                "articles": case.articles,
+                                "is_positive": case.is_positive,
+                            }
+                            for case in result.retrieval_info.negative_examples
+                        ],
+                    }
                 with open(args.output, 'w', encoding='utf-8') as f:
                     json.dump(output, f, ensure_ascii=False, indent=2)
-                logger.info(f"Result saved to {output}")
+                logger.info(f"Result saved to {args.output}")
             
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
