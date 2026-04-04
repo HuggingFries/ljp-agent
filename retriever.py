@@ -337,13 +337,14 @@ class HierarchicalRetrieverConfig:
 
 
 class HierarchicalEmbeddingRetriever:
-    """分层单库检索器
-    [1. llm猜测罪名候选] → [2. 根据罪名检索] → [3. 语义粗筛] → [4. LLM验证精筛]
+    """K-Means语义聚类分层检索器
+    [1. 找最近簇（根据embedding相似度）] → [2. 簇内范围过滤] → [3. 语义粗筛] → [4. LLM验证精筛]
     
     Attributes:
         config: 分层检索配置
         llm_client: 大模型客户端（给精筛用）
         llm_model: 大模型名称（给精筛用）
+        prefix: "pos"表示正例，"neg"表示负例
     """
     
     def __init__(
@@ -365,56 +366,66 @@ class HierarchicalEmbeddingRetriever:
         self.llm_model = llm_model
         self.prefix = prefix
         
-        # 加载罪名列表
-        self.charge_list = self._load_charge_list()
+        # 加载簇标签列表
+        self.cluster_list = self._load_cluster_list()
+        # 预加载所有簇中心（用来计算相似度找最近簇）
+        self.cluster_centers = self._load_cluster_centers()
         # 预加载所有案例和embeddings到内存（数据集小，没问题）
-        # 一次性加载所有，按罪名逻辑分组，不用每个罪名一个文件夹
-        self.cases_map, self.embeddings_map = self._load_charge_index()
+        # 一次性加载所有，按簇逻辑分组
+        self.cases_map, self.embeddings_map = self._load_cluster_index()
         
         # 初始化精筛策略（始终LLM）
         self._init_strategy()
         
-        logger.info(f"Loaded {prefix} hierarchical retriever:")
-        logger.info(f"  Charges: {len(self.charge_list)}, total cases: {sum(len(v) for v in self.cases_map.values())}")
+        logger.info(f"Loaded {prefix} clustered (K-Means) retriever:")
+        logger.info(f"  Clusters: {len(self.cluster_list)}, total cases: {sum(len(v) for v in self.cases_map.values())}")
         logger.info(f"  Fine adaptive mode: llm, coarse_k={config.coarse_k}")
     
-    def _load_charge_list(self) -> List[str]:
-        """加载罪名列表"""
-        charge_list_path = os.path.join(self.config.index_root, f"{self.prefix}_charge_list.json")
-        if not os.path.exists(charge_list_path):
-            logger.warning(f"Charge list not found: {charge_list_path}")
+    def _load_cluster_list(self) -> List[str]:
+        """加载簇标签列表"""
+        cluster_list_path = os.path.join(self.config.index_root, f"{self.prefix}_cluster_list.json")
+        if not os.path.exists(cluster_list_path):
+            logger.warning(f"Cluster list not found: {cluster_list_path}")
             return []
-        with open(charge_list_path, 'r', encoding='utf-8') as f:
+        with open(cluster_list_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    def _load_charge_index(self) -> Tuple[Dict[str, List[Case]], Dict[str, np.ndarray]]:
-        """加载所有罪名的索引（一次性加载，逻辑分组）
+    def _load_cluster_centers(self) -> np.ndarray:
+        """加载簇中心矩阵"""
+        centers_path = os.path.join(self.config.index_root, f"{self.prefix}_cluster_centers.npy")
+        if not os.path.exists(centers_path):
+            logger.warning(f"Cluster centers not found: {centers_path}")
+            return np.array([])
+        return np.load(centers_path)
+    
+    def _load_cluster_index(self) -> Tuple[Dict[str, List[Case]], Dict[str, np.ndarray]]:
+        """加载所有簇的索引（一次性加载，逻辑分组）
         Returns:
-            (cases_map, embeddings_map): 按罪名分组的案例和embedding
+            (cases_map, embeddings_map): 按簇分组的案例和embedding
         """
         # 加载偏移信息
-        offsets_path = os.path.join(self.config.index_root, f"{self.prefix}_charge_offsets.json")
+        offsets_path = os.path.join(self.config.index_root, f"{self.prefix}_cluster_offsets.json")
         cases_path = os.path.join(self.config.index_root, f"{self.prefix}_cases.json")
         index_path = os.path.join(self.config.index_root, f"{self.prefix}_index.npy")
         
         with open(offsets_path, 'r', encoding='utf-8') as f:
-            charge_offsets = json.load(f)
+            cluster_offsets = json.load(f)
         
         with open(cases_path, 'r', encoding='utf-8') as f:
             all_cases_data = json.load(f)
         
         all_embeddings = np.load(index_path)
         
-        # 按罪名分组
+        # 按簇分组
         cases_map: Dict[str, List[Case]] = {}
         embeddings_map: Dict[str, np.ndarray] = {}
         
-        for charge, offset_info in charge_offsets.items():
+        for cluster, offset_info in cluster_offsets.items():
             start = offset_info['start']
             count = offset_info['count']
             end = start + count
             
-            # 取出该罪名的案例
+            # 取出该簇的案例
             cases_data = all_cases_data[start:end]
             cases: List[Case] = []
             for item in cases_data:
@@ -426,13 +437,13 @@ class HierarchicalEmbeddingRetriever:
                     is_positive=item['is_positive'],
                 ))
             
-            # 取出该罪名的embeddings
+            # 取出该簇的embeddings
             embeddings = all_embeddings[start:end]
             
-            cases_map[charge] = cases
-            embeddings_map[charge] = embeddings
+            cases_map[cluster] = cases
+            embeddings_map[cluster] = embeddings
         
-        logger.info(f"Loaded {len(cases_map)} charges, {len(all_cases_data)} total {self.prefix} cases")
+        logger.info(f"Loaded {len(cases_map)} clusters, {len(all_cases_data)} total {self.prefix} cases")
         return cases_map, embeddings_map
     
     def _init_strategy(self):
@@ -453,52 +464,54 @@ class HierarchicalEmbeddingRetriever:
         self,
         target_embedding: np.ndarray,
         target_fact: str,
-        candidate_charges: List[str],
+        candidate_charges: List[str] = None,
         k: Optional[int] = None,
     ) -> Tuple[List[Case], float, int]:
-        """分层检索top-k
+        """K-Means聚类分层检索top-k
+        第一步：计算目标embedding和各个簇中心的相似度，取top-K最近簇
+        第二步：只在最近簇内找相似案例
+        
         Args:
             target_embedding: 目标案件embedding
             target_fact: 目标案件事实（给LLM验证用）
-            candidate_charges: 大模型预测的候选罪名
+            candidate_charges: 兼容性保留，不再使用
             k: 固定k，None则自适应
         Returns:
             (top_cases, max_sim, final_k)
         """
-        logger.info(f"[分层检索] 第一层：根据候选罪名过滤范围，候选罪名={candidate_charges}")
+        # 计算目标和各个簇中心的余弦相似度
+        target_norm = target_embedding / np.linalg.norm(target_embedding)
+        centers_norm = self.cluster_centers / np.linalg.norm(self.cluster_centers, axis=1, keepdims=True)
+        similarities = centers_norm @ target_norm
         
-        # 收集所有候选罪名对应的案例和embedding
+        # 找top-2最相似簇（取两个覆盖可能性更大）
+        num_clusters = len(self.cluster_list)
+        top_clusters = min(2, num_clusters)
+        sorted_indices = np.argsort(-similarities)
+        top_cluster_indices = sorted_indices[:top_clusters]
+        
+        # 收集这些簇里的所有案例
         all_cases: List[Case] = []
         all_embeddings: List[np.ndarray] = []
         
-        for charge in candidate_charges:
-            # 格式化罪名（去掉罪后缀），并且替换文件名特殊字符
-            c = charge.strip()
-            if c.endswith("罪"):
-                c = c[:-1]
-            # 保存文件名时 / 被替换成 _，查找时也替换
-            c_safe = c.replace('/', '_')
-            # 从本分组找，先试安全名，找不到再试原名
-            if c_safe in self.cases_map:
-                logger.info(f"[分层检索] 找到罪名 '{c}'，包含 {len(self.cases_map[c_safe])} 个候选案例")
-                all_cases.extend(self.cases_map[c_safe])
-                all_embeddings.append(self.embeddings_map[c_safe])
-            elif c in self.cases_map:
-                logger.info(f"[分层检索] 找到罪名 '{c}'，包含 {len(self.cases_map[c])} 个候选案例")
-                all_cases.extend(self.cases_map[c])
-                all_embeddings.append(self.embeddings_map[c])
-            else:
-                logger.warning(f"[分层检索] 候选罪名 '{c}' 在索引中不存在，跳过")
+        logger.info(f"[聚类分层检索] 第一层：找top-{top_clusters}最近簇，最高相似度={similarities[sorted_indices[0]]:.4f}")
+        
+        for idx in top_cluster_indices:
+            cluster_label = self.cluster_list[idx]
+            if cluster_label in self.cases_map:
+                logger.info(f"[聚类分层检索] 找到簇 '{cluster_label}'，包含 {len(self.cases_map[cluster_label])} 个候选案例")
+                all_cases.extend(self.cases_map[cluster_label])
+                all_embeddings.append(self.embeddings_map[cluster_label])
         
         if not all_cases:
-            # 如果找不到， fallback 到所有罪名
-            logger.warning(f"[分层检索] 未找到匹配候选案例，回退到全量索引")
-            for charge in self.charge_list:
-                if charge in self.cases_map:
-                    all_cases.extend(self.cases_map[charge])
-                    all_embeddings.append(self.embeddings_map[charge])
+            # 如果找不到， fallback 到所有簇
+            logger.warning(f"[聚类分层检索] 未找到匹配候选案例，回退到全量索引")
+            for cluster in self.cluster_list:
+                if cluster in self.cases_map:
+                    all_cases.extend(self.cases_map[cluster])
+                    all_embeddings.append(self.embeddings_map[cluster])
         
-        logger.info(f"[分层检索] 第一层过滤完成，剩余 {len(all_cases)} 个候选案例")
+        logger.info(f"[聚类分层检索] 第一层过滤完成，剩余 {len(all_cases)} 个候选案例")
         
         if not all_cases:
             logger.error(f"[分层检索] 回退后仍然没有找到任何案例，检查索引是否构建正确，返回空结果")
@@ -742,7 +755,8 @@ def create_retriever_from_config(
         return FlatAdaptiveRAGRetriever(pos_retriever, neg_retriever)
     
     elif mode == "hierarchical":
-        # 分层检索模式
+        # 分层检索模式：K-Means语义聚类，索引存在data/index_clustered
+        logger.info("[初始化] 使用K-Means语义聚类分层检索模式")
         def _parse_hierarchical_config(cfg: dict, index_root: str) -> HierarchicalRetrieverConfig:
             """解析单个分层检索器配置"""
             llm_config = LLMVerifiedAdaptiveKConfig(
@@ -759,11 +773,11 @@ def create_retriever_from_config(
                 llm=llm_config,
             )
         
-        hierarchical_cfg = config_dict.get("hierarchical", {})
-        index_root = hierarchical_cfg.get("index_root", "data/index_by_charge")
+        # K-Means聚类索引固定输出到data/index_clustered
+        index_root = "data/index_clustered"
         
-        positive_dict = hierarchical_cfg.get("positive", {})
-        negative_dict = hierarchical_cfg.get("negative", {})
+        positive_dict = config_dict.get("positive", {})
+        negative_dict = config_dict.get("negative", {})
         
         pos_config = _parse_hierarchical_config(positive_dict, index_root)
         neg_config = _parse_hierarchical_config(negative_dict, index_root)

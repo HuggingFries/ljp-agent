@@ -231,13 +231,24 @@ class LJPAgentWithRAG:
         target_fact = target_case.fact
         
         # 自适应检索正负案例
-        # 如果是分层检索，第一步需要先预测候选罪名
-        # 判断类型：HierarchicalAdaptiveRAGRetriever = 分层，需要先预测罪名
-        if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'charge_list'):
-            # 第一步：预测候选罪名（已经在_predict_candidate_charges里打日志了）
+        # 判断检索器类型：
+        # 1. 聚类分层检索：已经有簇中心，自动找最近簇，不需要预测罪名
+        # 2. 旧罪名分层检索：需要先预测候选罪名
+        # 3. 普通平面检索：直接从全库检索
+        if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'cluster_list'):
+            # K-Means聚类分层检索：不需要预测候选罪名，检索器内部自动找最近簇
+            logger.info("[步骤2] K-Means聚类分层检索正负案例")
+            retrieval_result = self.adaptive_retriever.retrieve(
+                target_embedding,
+                target_fact=target_fact,
+                candidate_charges=[],  # 聚类分层不需要候选，占位
+                k_positive=self.k_positive,
+                k_negative=self.k_negative
+            )
+        elif hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'charge_list'):
+            # 旧罪名分层检索：第一步需要先预测候选罪名
             candidate_charges = self._predict_candidate_charges(target_fact, len(self.charge_names))
-            # 分层检索正例负例
-            logger.info("[步骤2] 分层检索正负案例")
+            logger.info("[步骤2] 罪名分层检索正负案例")
             retrieval_result = self.adaptive_retriever.retrieve(
                 target_embedding,
                 target_fact=target_fact,

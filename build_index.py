@@ -1,11 +1,12 @@
 """
-构建正负案例向量索引，支持两种模式：
+构建正负案例向量索引，支持三种模式：
 1. flat: 传统平面索引，所有案例放一起（兼容旧版本）
-2. hierarchical: 分层索引，按罪名分组存储，检索时先筛罪名再找相似
+2. clustered: K-Means语义聚类分层索引，按语义分簇，检索先找簇再找相似（推荐）
+   - 解决按罪名分组缺点：事实相似但罪名不同的案例会被错误过滤
 
-分层索引构建流程：
-- 所有案例保存在同一个文件里，用charge分组标记，逻辑分层而非物理分层
-- 加载时一次性读入所有案例，检索第一步根据候选罪名过滤范围，再找相似
+聚类索引构建流程：
+- 所有案例embedding做K-Means聚类，每个案例得到一个簇标签
+- 按簇逻辑分组存储，加载时一次性读入，检索第一步找最相似簇，再在簇内找相似
 """
 
 import os
@@ -13,10 +14,13 @@ import json
 import numpy as np
 import argparse
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from collections import defaultdict
 
 # 使用国内镜像加速huggingface下载
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+from sklearn.cluster import KMeans
 
 from sentence_transformers import SentenceTransformer
 
@@ -45,14 +49,13 @@ def load_positives(file_path: str) -> List[Case]:
 
 def load_negatives(file_path: str) -> List[Case]:
     """加载生成好的负例
-    负例：按**正确罪名**分组，因为我们要找"正确罪名相同，事实相似，判决错误"的案例
-    所以分组用 true_charges，不是 wrong_charges
+    负例保存true_charges方便分组，但聚类还是用事实embedding
     """
     cases = []
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
         for item in data:
-            # 负例保持wrong标签，但分组按正确罪名
+            # 负例保持wrong标签
             case = Case(
                 fact=item['fact'],
                 charges=item['wrong_charges'],
@@ -60,42 +63,11 @@ def load_negatives(file_path: str) -> List[Case]:
                 judgment='',
                 is_positive=False
             )
-            # 保存正确罪名，用来分组
+            # 保存正确罪名，可选保留但不用于分组
             case.true_charges = item['true_charges']
             cases.append(case)
     logger.info(f"Loaded {len(cases)} negative examples")
     return cases
-
-
-def group_cases_by_charge(cases: List[Case], is_negative: bool = False) -> Dict[str, List[Case]]:
-    """将案例按罪名分组
-    一个案例可能有多个罪名，会放进多个分组里（因为一个案例涉及多个罪名，都要能被搜到）
-    
-    Args:
-        cases: 案例列表
-        is_negative: 是否为负例，负例按正确罪名分组，不是错的罪名
-    """
-    charge_map: Dict[str, List[Case]] = {}
-    for case in cases:
-        # 负例：按正确罪名分组（我们要在正确罪名下找错误判决对比）
-        # 正例：正常按罪名分组
-        if is_negative and hasattr(case, 'true_charges'):
-            charges = case.true_charges
-        else:
-            charges = case.charges
-        
-        for charge in charges:
-            charge = charge.strip()
-            # 格式化罪名，去掉"罪"后缀统一命名
-            if charge.endswith("罪"):
-                charge = charge[:-1]
-            if charge not in charge_map:
-                charge_map[charge] = []
-            charge_map[charge].append(case)
-    
-    logger.info(f"Grouped {len(cases)} cases into {len(charge_map)} distinct charges"
-              f"{' (negative, grouped by true charge)' if is_negative else ''}")
-    return charge_map
 
 
 def encode_cases(cases: List[Case], model: SentenceTransformer) -> np.ndarray:
@@ -109,63 +81,99 @@ def encode_cases(cases: List[Case], model: SentenceTransformer) -> np.ndarray:
     return np.array(embeddings)
 
 
-def save_hierarchical_index(
-    charge_map: Dict[str, List[Case]],
-    embeddings_map: Dict[str, np.ndarray],
+def do_kmeans_clustering(embeddings: np.ndarray, n_clusters: int, random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """对embeddings做K-Means聚类
+    Args:
+        embeddings: (n_samples, n_dim) 所有案例的embedding
+        n_clusters: 聚类数目k
+    Returns:
+        labels: 每个案例的簇标签
+        cluster_centers: 簇中心 (n_clusters, n_dim)
+    """
+    logger.info(f"Running K-Means clustering with n_clusters={n_clusters}...")
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = kmeans.fit_predict(embeddings)
+    cluster_centers = kmeans.cluster_centers_
+    
+    # 统计每个簇大小
+    cluster_counts = np.bincount(labels)
+    for i in range(n_clusters):
+        logger.info(f"  Cluster {i}: {cluster_counts[i]} cases")
+    
+    return labels, cluster_centers
+
+
+def save_clustered_index(
+    cases: List[Case],
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    cluster_centers: np.ndarray,
     output_root: str,
     prefix: str,  # "pos" or "neg"
+    n_clusters: int,
 ):
-    """保存分层索引：统一保存在几个文件中，逻辑分组
-    - {prefix}_cases.json: 所有案例列表，每个案例带charge标记
+    """保存聚类分层索引：统一保存在几个文件中，按簇逻辑分组
+    - {prefix}_cases.json: 所有案例列表，每个案例带cluster标签
     - {prefix}_index.npy: 所有embeddings拼接在一起
-    - {prefix}_charge_offsets.json: 每个罪名在大数组中的起始偏移和长度
-    - {prefix}_charge_list.json: 所有罪名列表
+    - {prefix}_cluster_offsets.json: 每个簇在大数组中的起始偏移和长度
+    - {prefix}_cluster_centers.npy: 簇中心矩阵，用来在线找最近簇
+    - {prefix}_cluster_list.json: 所有簇标签列表
     """
     os.makedirs(output_root, exist_ok=True)
     
-    # 收集所有案例，记录每个罪名的偏移
+    # 收集所有案例，记录每个簇的偏移
     all_cases = []
     all_embeddings = []
-    charge_offsets = {}
+    cluster_offsets = {}
     current_offset = 0
     
-    # 按罪名顺序拼接
-    all_charges = list(charge_map.keys())
-    all_charges.sort()
+    # 按簇顺序拼接
+    clusters = list(range(n_clusters))
     
-    for charge in all_charges:
-        cases = charge_map[charge]
-        embeddings = embeddings_map[charge]
-        n = len(cases)
+    for label in clusters:
+        # 找出所有该簇的案例和embedding
+        indices = np.where(labels == label)[0]
+        n = len(indices)
+        
+        if n == 0:
+            logger.warning(f"Cluster {label} is empty, skipping")
+            continue
         
         # 记录偏移信息
-        charge_offsets[charge] = {
+        cluster_offsets[str(label)] = {  # json key必须是字符串
             "start": current_offset,
             "count": n
         }
         
         # 添加到总列表
-        all_cases.extend([{
-            "fact": case.fact,
-            "charges": case.charges,
-            "articles": case.articles,
-            "is_positive": case.is_positive,
-            "charge_group": charge
-        } for case in cases])
+        for idx in indices:
+            case = cases[idx]
+            all_cases.append({
+                "fact": case.fact,
+                "charges": case.charges,
+                "articles": case.articles,
+                "is_positive": case.is_positive,
+                "cluster": int(label),
+            })
         
-        all_embeddings.append(embeddings)
+        # 添加embedding
+        all_embeddings.append(embeddings[indices])
         current_offset += n
     
     # 拼接所有embeddings
     concatenated = np.concatenate(all_embeddings, axis=0)
     
-    # 保存罪名列表
-    with open(os.path.join(output_root, f"{prefix}_charge_list.json"), 'w', encoding='utf-8') as f:
-        json.dump(all_charges, f, ensure_ascii=False, indent=2)
+    # 保存簇标签列表
+    cluster_list = list(cluster_offsets.keys())
+    with open(os.path.join(output_root, f"{prefix}_cluster_list.json"), 'w', encoding='utf-8') as f:
+        json.dump(cluster_list, f, ensure_ascii=False, indent=2)
     
     # 保存偏移信息
-    with open(os.path.join(output_root, f"{prefix}_charge_offsets.json"), 'w', encoding='utf-8') as f:
-        json.dump(charge_offsets, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_root, f"{prefix}_cluster_offsets.json"), 'w', encoding='utf-8') as f:
+        json.dump(cluster_offsets, f, ensure_ascii=False, indent=2)
+    
+    # 保存簇中心
+    np.save(os.path.join(output_root, f"{prefix}_cluster_centers.npy"), cluster_centers)
     
     # 保存所有案例
     with open(os.path.join(output_root, f"{prefix}_cases.json"), 'w', encoding='utf-8') as f:
@@ -175,8 +183,13 @@ def save_hierarchical_index(
     np.save(os.path.join(output_root, f"{prefix}_index.npy"), concatenated)
     
     total_cases = len(all_cases)
-    logger.info(f"Saved hierarchical {prefix} index: {len(all_charges)} charges, {total_cases} total cases")
-    logger.info(f"  Files: {prefix}_charge_list.json, {prefix}_charge_offsets.json, {prefix}_cases.json, {prefix}_index.npy")
+    logger.info(f"Saved clustered {prefix} index: {len(cluster_offsets)} clusters, {total_cases} total cases")
+    logger.info(f"  Files:")
+    logger.info(f"  ├─ {prefix}_cluster_list.json    : 所有簇标签列表")
+    logger.info(f"  ├─ {prefix}_cluster_offsets.json: 每个簇偏移信息")
+    logger.info(f"  ├─ {prefix}_cluster_centers.npy : 簇中心矩阵")
+    logger.info(f"  ├─ {prefix}_cases.json         : 所有案例")
+    logger.info(f"  └─ {prefix}_index.npy          : 所有embeddings")
 
 
 def save_flat_index(cases: List[Case], embeddings: np.ndarray, output_dir: str, prefix: str):
@@ -203,11 +216,11 @@ def save_flat_index(cases: List[Case], embeddings: np.ndarray, output_dir: str, 
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Build embedding index, support flat/hierarchical')
+    parser = argparse.ArgumentParser(description='Build embedding index, support flat/clustered')
     parser.add_argument('--config', type=str, default='config.json',
                        help='Configuration file path')
-    parser.add_argument('--mode', type=str, default='hierarchical', choices=['flat', 'hierarchical'],
-                       help='Index mode: flat=all in one, hierarchical=group by charge (logical grouping)')
+    parser.add_argument('--mode', type=str, default='clustered', choices=['flat', 'clustered'],
+                       help='Index mode: flat=all in one, clustered=K-Means semantic clustering')
     parser.add_argument('--pos-input', type=str, default='data/sampled_positives.json',
                        help='Input positive samples json')
     parser.add_argument('--neg-input', type=str, default='data/generated_negatives.json',
@@ -216,6 +229,8 @@ def main():
                        help='Output directory for index files (overrides config)')
     parser.add_argument('--embedding-model', type=str, default=None,
                        help='Sentence embedding model name (overrides config)')
+    parser.add_argument('--n-clusters', type=int, default=None,
+                       help='Number of clusters for K-Means (overrides config, default: based on total cases)')
     args = parser.parse_args()
     
     # 读取配置
@@ -231,7 +246,7 @@ def main():
     model = SentenceTransformer(embedding_model)
     
     if args.mode == 'flat':
-        # ========== 旧版平面索引 ==========
+        # ========== 平面索引 ==========
         # 处理正例
         pos_cases = load_positives(args.pos_input)
         pos_embeddings = encode_cases(pos_cases, model)
@@ -247,38 +262,46 @@ def main():
         logger.info(f"Negative index: {output_dir}/neg_cases.json + neg_index.npy")
     
     else:
-        # ========== 分层索引（逻辑分组，统一存储） ==========
+        # ========== K-Means聚类分层索引 ==========
         # 处理正例
         pos_cases = load_positives(args.pos_input)
-        pos_charge_map = group_cases_by_charge(pos_cases, is_negative=False)
+        logger.info(f"Encoding all positive cases...")
+        pos_embeddings = encode_cases(pos_cases, model)
         
-        # 每个罪名单独编码
-        pos_embeddings_map: Dict[str, np.ndarray] = {}
-        for charge, cases in pos_charge_map.items():
-            logger.info(f"Encoding positive cases for charge: {charge} ({len(cases)} cases)")
-            pos_embeddings_map[charge] = encode_cases(cases, model)
-        
-        # 处理负例：负例按正确罪名分组
+        # 处理负例
         neg_cases = load_negatives(args.neg_input)
-        neg_charge_map = group_cases_by_charge(neg_cases, is_negative=True)
+        logger.info(f"Encoding all negative cases...")
+        neg_embeddings = encode_cases(neg_cases, model)
         
-        # 每个罪名单独编码
-        neg_embeddings_map: Dict[str, np.ndarray] = {}
-        for charge, cases in neg_charge_map.items():
-            logger.info(f"Encoding negative cases for charge: {charge} ({len(cases)} cases)")
-            neg_embeddings_map[charge] = encode_cases(cases, model)
+        # 确定聚类数目k
+        total_pos = len(pos_cases)
+        if args.n_clusters is not None:
+            n_clusters_pos = args.n_clusters
+        else:
+            # 经验规则：平均每个簇大概20-40个案例
+            n_clusters_pos = max(10, total_pos // 30)
+        logger.info(f"Positive total: {total_pos}, n_clusters={n_clusters_pos} (avg {total_pos/n_clusters_pos:.1f} per cluster)")
         
-        # 保存索引（统一文件）
-        hierarchical_root = os.path.join(output_dir, "index_by_charge")
-        save_hierarchical_index(pos_charge_map, pos_embeddings_map, hierarchical_root, "pos")
-        save_hierarchical_index(neg_charge_map, neg_embeddings_map, hierarchical_root, "neg")
+        # K-Means聚类正例
+        pos_labels, pos_centers = do_kmeans_clustering(pos_embeddings, n_clusters_pos)
         
-        logger.info("All done! Hierarchical index (logical grouping) built successfully.")
-        logger.info(f"Index root: {hierarchical_root}")
-        logger.info(f"  ├─ pos_charge_list.json    : 所有正例罪名列表")
-        logger.info(f"  ├─ pos_charge_offsets.json: 每个罪名偏移信息")
-        logger.info(f"  ├─ pos_cases.json         : 所有正例案例")
-        logger.info(f"  └─ pos_index.npy          : 所有正例embeddings")
+        # 负例聚类（独立聚类）
+        total_neg = len(neg_cases)
+        if args.n_clusters is not None:
+            n_clusters_neg = args.n_clusters
+        else:
+            n_clusters_neg = max(10, total_neg // 30)
+        logger.info(f"Negative total: {total_neg}, n_clusters={n_clusters_neg} (avg {total_neg/n_clusters_neg:.1f} per cluster)")
+        
+        neg_labels, neg_centers = do_kmeans_clustering(neg_embeddings, n_clusters_neg)
+        
+        # 保存聚类索引
+        clustered_root = os.path.join(output_dir, "index_clustered")
+        save_clustered_index(pos_cases, pos_embeddings, pos_labels, pos_centers, clustered_root, "pos", n_clusters_pos)
+        save_clustered_index(neg_cases, neg_embeddings, neg_labels, neg_centers, clustered_root, "neg", n_clusters_neg)
+        
+        logger.info("All done! Clustered (K-Means semantic) index built successfully.")
+        logger.info(f"Index root: {clustered_root}")
 
 
 if __name__ == "__main__":

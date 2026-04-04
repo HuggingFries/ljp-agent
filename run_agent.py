@@ -263,7 +263,7 @@ def load_rag_index(
         # 统计计数打日志
         pos_count = sum(len(v) for v in adaptive_retriever.pos_retriever.cases_map.values())
         neg_count = sum(len(v) for v in adaptive_retriever.neg_retriever.cases_map.values())
-        logger.info(f"[初始化][分层模式] 加载完成: 正例={pos_count} ({len(adaptive_retriever.pos_retriever.charge_list)} 个罪名), 负例={neg_count} ({len(adaptive_retriever.neg_retriever.charge_list)} 个罪名)")
+        logger.info(f"[初始化][聚类分层模式] 加载完成: 正例={pos_count} ({len(adaptive_retriever.pos_retriever.cluster_list)} 个簇), 负例={neg_count} ({len(adaptive_retriever.neg_retriever.cluster_list)} 个簇)")
         
         return adaptive_retriever, embedding_model
     
