@@ -232,7 +232,8 @@ class LJPAgentWithRAG:
         
         # 自适应检索正负案例
         # 如果是分层检索，第一步需要先预测候选罪名
-        if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'pos_charge_list'):
+        # 判断类型：HierarchicalAdaptiveRAGRetriever = 分层，需要先预测罪名
+        if hasattr(self.adaptive_retriever, 'pos_retriever') and hasattr(self.adaptive_retriever.pos_retriever, 'charge_list'):
             # 第一步：预测候选罪名（已经在_predict_candidate_charges里打日志了）
             candidate_charges = self._predict_candidate_charges(target_fact, len(self.charge_names))
             # 分层检索正例负例
@@ -245,7 +246,7 @@ class LJPAgentWithRAG:
                 k_negative=self.k_negative
             )
         else:
-            # 普通平面检索
+            # 普通平面检索（FlatAdaptiveRAGRetriever）
             logger.info("[步骤1][平面检索] 直接从全库检索")
             retrieval_result = self.adaptive_retriever.retrieve(
                 target_embedding,

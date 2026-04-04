@@ -34,10 +34,9 @@ except ImportError:
 
 from agent import Case, DataLoader, LJPAgentWithRAG, PredictionResult
 from retriever import (
-    AdaptiveRAGRetriever,
-    create_retriever_from_config,
+    FlatAdaptiveRAGRetriever,
     HierarchicalAdaptiveRAGRetriever,
-    create_hierarchical_retriever_from_config,
+    create_retriever_from_config,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +153,7 @@ def load_rag_index(
     config: dict,
     llm_client=None,
     llm_model=None,
-) -> tuple[AdaptiveRAGRetriever | HierarchicalAdaptiveRAGRetriever, any]:
+) -> tuple[FlatAdaptiveRAGRetriever | HierarchicalAdaptiveRAGRetriever, any]:
     """从配置加载RAG索引
     支持两种模式：
     - flat: 平面索引，所有案例放一起
@@ -177,18 +176,18 @@ def load_rag_index(
     embedding_model = SentenceTransformer(embedding_model_name)
     logger.info(f"[初始化] 加载Embedding模型完成: {embedding_model_name}")
     
-    # 从配置读取检索模式
+    # 从配置读取检索模式，create_retriever_from_config自动创建对应类型
     retriever_config = config.get("retriever", {})
     retriever_mode = retriever_config.get("mode", "flat")
+    adaptive_retriever = create_retriever_from_config(
+        retriever_config,
+        llm_client=llm_client,
+        llm_model=llm_model,
+    )
     
     if retriever_mode == "flat":
         # ========== 平面索引模式 ==========
         logger.info("[初始化] 使用平面检索模式 (flat)")
-        adaptive_retriever = create_retriever_from_config(
-            retriever_config,
-            llm_client=llm_client,
-            llm_model=llm_model,
-        )
         
         # 加载案例和预计算embeddings
         pos_cases_path = os.path.join(index_dir, "pos_cases.json")
@@ -232,24 +231,18 @@ def load_rag_index(
         
         # 日志
         logger.info(f"[初始化][平面模式] 加载完成: 正例={len(pos_cases)}, 负例={len(neg_cases)}")
-        logger.info(f"[初始化][平面模式] 正例模式={adaptive_retriever.pos_retriever.config.adaptive_mode}, 负例模式={adaptive_retriever.neg_retriever.config.adaptive_mode}")
         
         return adaptive_retriever, embedding_model
     
     elif retriever_mode == "hierarchical":
         # ========== 分层索引模式 ==========
         logger.info("[初始化] 使用分层检索模式 (hierarchical)")
-        hierarchical_config = retriever_config.get("hierarchical", {})
-        adaptive_retriever = create_hierarchical_retriever_from_config(
-            hierarchical_config,
-            llm_client=llm_client,
-            llm_model=llm_model,
-        )
+        # 分层索引已经在创建时自动加载完毕了（create_retriever_from_config内部处理）
         
-        # 分层索引已经在创建时加载完毕
-        pos_count = sum(len(v) for v in adaptive_retriever.pos_retriever.pos_cases.values())
-        neg_count = sum(len(v) for v in adaptive_retriever.neg_retriever.neg_cases.values())
-        logger.info(f"[初始化][分层模式] 加载完成: 正例={pos_count} ({len(adaptive_retriever.pos_retriever.pos_charge_list)} 个罪名), 负例={neg_count} ({len(adaptive_retriever.neg_retriever.pos_charge_list)} 个罪名)")
+        # 统计计数打日志
+        pos_count = sum(len(v) for v in adaptive_retriever.pos_retriever.cases_map.values())
+        neg_count = sum(len(v) for v in adaptive_retriever.neg_retriever.cases_map.values())
+        logger.info(f"[初始化][分层模式] 加载完成: 正例={pos_count} ({len(adaptive_retriever.pos_retriever.charge_list)} 个罪名), 负例={neg_count} ({len(adaptive_retriever.neg_retriever.charge_list)} 个罪名)")
         
         return adaptive_retriever, embedding_model
     
