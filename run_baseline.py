@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from agent import Case, DataLoader
 from baseline import ZeroShotLJPBaseline
-from main import load_api_config
+from run_agent import load_api_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -205,10 +205,14 @@ def main():
                        help='CAIL2018 test.json path')
     parser.add_argument('--max-samples', type=int, default=100,
                        help='Maximum number of samples to evaluate (for quick test)')
+    parser.add_argument('--config', type=str, default='config.json',
+                       help='Configuration file path')
     args = parser.parse_args()
     
     # 加载API配置
-    base_url, api_key, model_name = load_api_config()
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    base_url, api_key, model_name = load_api_config(config)
     
     # 初始化模型
     model = ZeroShotLJPBaseline(base_url=base_url, api_key=api_key, model_name=model_name)

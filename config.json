@@ -5,39 +5,20 @@
     "model_name": "deepseek-chat"
   },
   "retriever": {
+    "mode": "hierarchical",
+    "index_root": "data/index_by_charge",
+    "coarse_k": 10,
     "positive": {
-      "adaptive_mode": "llm",
-      "static": {
-        "min_k": 1,
-        "max_k": 5,
-        "alpha": 1.0,
-        "normalize": false,
-        "sim_min": null,
-        "sim_max": null
-      },
-      "llm": {
-        "min_k": 1,
-        "max_k": 5,
-        "initial_candidates": 20,
-        "step_add": 2
-      }
+      "min_k": 1,
+      "max_k": 5,
+      "initial_candidates": 20,
+      "step_add": 1
     },
     "negative": {
-      "adaptive_mode": "llm",
-      "static": {
-        "min_k": 1,
-        "max_k": 5,
-        "alpha": 1.0,
-        "normalize": false,
-        "sim_min": null,
-        "sim_max": null
-      },
-      "llm": {
-        "min_k": 1,
-        "max_k": 5,
-        "initial_candidates": 20,
-        "step_add": 2
-      }
+      "min_k": 1,
+      "max_k": 5,
+      "initial_candidates": 20,
+      "step_add": 1
     }
   },
   "index": {
