@@ -209,49 +209,8 @@ def load_rag_index(
     if retriever_mode == "flat":
         # ========== 平面索引模式 ==========
         logger.info("[初始化] 使用平面检索模式 (flat)")
-        
-        # 加载案例和预计算embeddings
-        pos_cases_path = os.path.join(index_dir, "pos_cases.json")
-        pos_index_path = os.path.join(index_dir, "pos_index.npy")
-        
-        with open(pos_cases_path, 'r', encoding='utf-8') as f:
-            pos_cases_data = json.load(f)
-        
-        pos_cases = []
-        for item in pos_cases_data:
-            pos_cases.append(Case(
-                fact=item['fact'],
-                charges=item['charges'],
-                articles=item['articles'],
-                judgment='',
-                is_positive=True
-            ))
-        
-        import numpy as np
-        pos_embeddings = np.load(pos_index_path)
-        adaptive_retriever.pos_retriever.index(pos_cases, pos_embeddings)
-        
-        neg_cases_path = os.path.join(index_dir, "neg_cases.json")
-        neg_index_path = os.path.join(index_dir, "neg_index.npy")
-        
-        with open(neg_cases_path, 'r', encoding='utf-8') as f:
-            neg_cases_data = json.load(f)
-        
-        neg_cases = []
-        for item in neg_cases_data:
-            neg_cases.append(Case(
-                fact=item['fact'],
-                charges=item['charges'],
-                articles=item['articles'],
-                judgment='',
-                is_positive=False
-            ))
-        
-        neg_embeddings = np.load(neg_index_path)
-        adaptive_retriever.neg_retriever.index(neg_cases, neg_embeddings)
-        
-        # 日志
-        logger.info(f"[初始化][平面模式] 加载完成: 正例={len(pos_cases)}, 负例={len(neg_cases)}")
+        # 数据加载已经在create_retriever_from_config内部完成，使用index_clustered全量数据
+        # pos: 2000 cases, neg: 2000 cases from data/index_clustered
         
         return adaptive_retriever, embedding_model
     

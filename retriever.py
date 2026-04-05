@@ -740,18 +740,59 @@ def create_retriever_from_config(
         pos_config = _parse_flat_config(positive_dict)
         neg_config = _parse_flat_config(negative_dict)
         
+        # 加载正例索引数据（使用index_clustered下的全量2000+案例，和分层保持一致）
+        from agent import Case
+        import json
+        import numpy as np
+        index_root = "data/index_clustered"
+        pos_cases_path = f"{index_root}/pos_cases.json"
+        pos_embeddings_path = f"{index_root}/pos_index.npy"
+        with open(pos_cases_path, 'r', encoding='utf-8') as f:
+            pos_case_dicts = json.load(f)
+        pos_cases = [
+            Case(
+                fact=c.get("fact", ""),
+                charges=c.get("charges", []),
+                articles=c.get("articles", []),
+                judgment=c.get("judgment", ""),
+                is_positive=c.get("is_positive", True)
+            )
+            for c in pos_case_dicts
+        ]
+        pos_embeddings = np.load(pos_embeddings_path)
+        
         pos_retriever = FlatEmbeddingRetriever(
             config=pos_config,
             llm_client=llm_client,
             llm_model=llm_model,
         )
+        pos_retriever.index(pos_cases, pos_embeddings)
+        
+        # 加载负例索引数据
+        neg_cases_path = f"{index_root}/neg_cases.json"
+        neg_embeddings_path = f"{index_root}/neg_index.npy"
+        with open(neg_cases_path, 'r', encoding='utf-8') as f:
+            neg_case_dicts = json.load(f)
+        neg_cases = [
+            Case(
+                fact=c.get("fact", ""),
+                charges=c.get("charges", []),
+                articles=c.get("articles", []),
+                judgment=c.get("judgment", ""),
+                is_positive=c.get("is_positive", False)
+            )
+            for c in neg_case_dicts
+        ]
+        neg_embeddings = np.load(neg_embeddings_path)
         
         neg_retriever = FlatEmbeddingRetriever(
             config=neg_config,
             llm_client=llm_client,
             llm_model=llm_model,
         )
+        neg_retriever.index(neg_cases, neg_embeddings)
         
+        logger.info(f"[Flat检索初始化完成] 正例: {len(pos_cases)} cases, 负例: {len(neg_cases)} cases")
         return FlatAdaptiveRAGRetriever(pos_retriever, neg_retriever)
     
     elif mode == "hierarchical":
