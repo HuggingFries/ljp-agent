@@ -25,6 +25,13 @@
     "index_dir": "data",
     "embedding_model": "uer/sbert-base-chinese-nli"
   },
+  "collection": {
+    "train_file": "data/final_all_data/first_stage/train.json",
+    "per_charge": 3,
+    "output": "data/negative_error_cases/collected_errors_with_reasons.json",
+    "max_workers": 20,
+    "seed": 42
+  },
   "evaluation": {
     "test_file": "data/final_all_data/first_stage/test.json",
     "seed": 42
