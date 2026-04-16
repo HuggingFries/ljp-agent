@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-断点续收集裸LLM错误案例
-从已有的收集结果加载进度，过滤出仅包含未填满罪名的测试集，继续收集
-解决越跑越慢问题：后续只处理需要的案件，不会空跑
+Collect error cases from vanilla LLM prediction for negative knowledge base construction.
 
-Author: LJP Project
-Date: 2026-04-13
+Usage:
+  python collect_negative_kb.py [options]
+
+Options:
+  --config CONFIG       Config file path (default: config.json)
+  --train-file FILE    Training data file path (default: from config)
+  --per-charge N       Number of error cases to collect per charge (default: 3)
+  --output PATH        Output knowledge base path (default: data/negative_error_cases/negative_kb_bare_llm.json)
+  --max-workers N      Parallel API workers (default: 10)
+  --seed SEED          Random seed (default: 42)
+  --resume-from PATH   Resume from existing checkpoint
 """
 
 import argparse
@@ -30,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def clean_charge(charge: str) -> str:
-    """清洗罪名：去掉末尾'罪'字"""
+    """Clean charge name: remove trailing '罪' character"""
     charge = charge.strip()
     if charge.endswith("罪"):
         charge = charge[:-1]
@@ -38,7 +45,7 @@ def clean_charge(charge: str) -> str:
 
 
 def clean_article(article: str) -> str:
-    """清洗法条：只保留数字"""
+    """Clean article number: keep digits only"""
     article = article.strip()
     digits = ''.join([c for c in article if c.isdigit()])
     if digits:
@@ -55,7 +62,7 @@ def bare_llm_predict(
     charge_names: List[str],
     article_names: List[str],
 ) -> Tuple[List[str], List[str], str, int, int]:
-    """裸LLM直接预测，不使用任何RAG检索"""
+    """Direct prediction with vanilla LLM, no RAG"""
     prompt = f"""你是一个专业的法律AI助手，擅长中国刑事案件判决预测。
 
 ## 可选罪名列表（必须从这里选择，不能自己编造）
@@ -119,8 +126,9 @@ def extract_error_reason(
     fact: str,
     true_charges: List[str],
     pred_charges: List[str],
+    pred_judgment: str,
 ) -> str:
-    """让LLM提取抽象错误原因"""
+    """Ask LLM to extract abstract error reason"""
     prompt = f"""请你作为法律AI专家，分析这个判决预测错误的案例，提取抽象、概括的错误原因。
 
 ## 案件事实
@@ -132,9 +140,12 @@ def extract_error_reason(
 ## AI预测错误罪名
 {', '.join(pred_charges)}
 
+## AI的推理过程
+{pred_judgment}
+
 ## 任务
 请你提炼出1-3句话抽象概括错误原因，重点关注：
-1. 为什么模型会预测错误？是哪些事实特征导致混淆？
+1. 结合AI的推理过程，为什么模型会预测错误？是哪些事实特征导致混淆？
 2. 这个案例容易和哪个罪名混淆？错误的关键点在哪里？
 
 要求：
@@ -156,7 +167,7 @@ def extract_error_reason(
 
 
 def load_cail2018(file_path: str) -> List[dict]:
-    """加载CAIL2018格式数据"""
+    """Load CAIL2018 format data"""
     data = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -167,26 +178,27 @@ def load_cail2018(file_path: str) -> List[dict]:
     return data
 
 
-def filter_test_data_by_charge(
-    test_data: List[dict],
+def filter_remaining_cases(
+    data: List[dict],
     charge_count: Dict[str, int],
     per_charge_target: int,
 ) -> List[dict]:
-    """过滤测试集：只保留至少包含一个未填满罪名的案件
-    这样后续处理不会空跑，每个案件都有处理必要，解决越跑越慢问题
+    """Filter dataset: keep only cases containing at least one unfilled charge
+    Once a charge reaches target, all cases with this charge are removed
+    to avoid unnecessary computation and speed up collection.
     """
     filtered = []
-    for item in test_data:
+    for item in data:
         charges = item.get('charge', [])
         if not charges and 'meta' in item:
             charges = item['meta'].get('accusation', [])
         true_charges = list(map(clean_charge, charges))
-        # 只要有一个罪名没满，就保留
+        # 只要有一个罪名没满，就保留这个案件
         for c in true_charges:
             if charge_count.get(c, 0) < per_charge_target:
                 filtered.append(item)
                 break
-    logger.info(f"过滤完成：原 {len(test_data)} 个案件 → 过滤后 {len(filtered)} 个需要处理")
+    logger.info(f"数据集过滤完成：剩余 {len(filtered)}/{len(data)} 个案件需要处理")
     return filtered
 
 
@@ -196,10 +208,8 @@ def process_single_case(
     model_name: str,
     charge_names: List[str],
     article_names: List[str],
-    charge_count: Dict[str, int],
-    per_charge_target: int,
 ) -> Dict[str, Any]:
-    """并行处理单个案件：预测 + 判断是否需要收集"""
+    """Process single case in parallel: predict + check for error"""
     # 读取原始数据
     fact = item.get('fact', '')
     charges = item.get('charge', [])
@@ -217,7 +227,7 @@ def process_single_case(
     if not fact or not true_charges:
         return None
     
-    # 已经过滤过了，这里肯定有罪名没满，直接处理
+    # 裸LLM预测
     try:
         pred_charges_list, pred_articles_list, pred_judgment, prompt_tokens, completion_tokens = bare_llm_predict(
             client,
@@ -232,13 +242,11 @@ def process_single_case(
         # 判断是否预测错误
         if pred_charges == true_charges_set:
             # 预测正确，不需要
-            return {
-                "type": "correct",
-            }
+            return {"type": "correct"}
         
-        # 预测错误，需要收集
+        # 预测错误，返回数据待收集
         return {
-            "type": "error_needed",
+            "type": "error",
             "fact": fact,
             "true_charges": list(true_charges_set),
             "predicted_charges": list(pred_charges),
@@ -252,84 +260,92 @@ def process_single_case(
     except Exception as e:
         logger.error(f"处理案件出错: {e}")
         return {
-            "type": "error",
+            "type": "failed",
             "error": str(e),
         }
 
 
-def resume_collect(
+def collect_error_cases(
     client: OpenAI,
     model_name: str,
-    original_test_data: List[dict],
-    existing_result_path: str,
+    train_data: List[dict],
     charge_names: List[str],
     article_names: List[str],
     output_file: str,
     per_charge_target: int = 3,
     max_workers: int = 10,
+    resume_from: str = None,
 ) -> None:
-    """断点续收集：从已有结果继续收集"""
+    """
+    Main collection function: support fresh collection and resume from checkpoint
     
-    # ========== 第一步：加载已有收集结果 ==========
-    logger.info(f"加载已有收集结果: {existing_result_path}")
-    with open(existing_result_path, 'r', encoding='utf-8') as f:
-        existing = json.load(f)
-    
-    existing_error_cases = existing.get("error_cases", [])
-    existing_charge_count = existing.get("metadata", {}).get("charge_count", {})
-    existing_total_processed = existing.get("metadata", {}).get("total_processed", 0)
-    existing_total_errors = existing.get("metadata", {}).get("total_errors", 0)
-    existing_total_correct = existing.get("metadata", {}).get("total_correct", 0)
-    
-    logger.info(f"已有结果: {len(existing_error_cases)} 错误案例，进度:")
-    done = sum(1 for cnt in existing_charge_count.values() if cnt >= per_charge_target)
-    total = len(existing_charge_count)
-    logger.info(f"  {done}/{total} 个罪名已完成，{total - done} 个仍需收集")
-    
-    # ========== 第二步：过滤测试集，只保留需要处理的案件 ==========
-    logger.info("过滤测试集，只保留包含未填满罪名的案件...")
-    filtered_test_data = filter_test_data_by_charge(
-        original_test_data,
-        existing_charge_count,
-        per_charge_target,
-    )
-    
-    if not filtered_test_data:
-        logger.info("所有罪名都已收集完成！不需要继续处理了")
-        return
-    
-    # ========== 第三步：打乱顺序，开始并行收集 ==========
-    charge_count = existing_charge_count.copy()
-    error_cases = existing_error_cases.copy()
-    total_processed = existing_total_processed
-    total_errors = existing_total_errors
-    total_correct = existing_total_correct
+    Optimization:
+    - After a charge reaches target number of errors, all cases of this
+      charge are filtered out from remaining processing
+    - This ensures later batches only process needed cases, avoids empty run
+    """
+    # ========== Initialize: fresh or resume ==========
+    if resume_from and os.path.exists(resume_from):
+        # Resume from existing checkpoint
+        logger.info(f"Resuming from checkpoint: {resume_from}")
+        with open(resume_from, 'r', encoding='utf-8') as f:
+            existing = json.load(f)
+        error_cases = existing.get("error_cases", [])
+        charge_count = existing.get("metadata", {}).get("charge_count", {})
+        total_processed = existing.get("metadata", {}).get("total_processed", 0)
+        total_errors = existing.get("metadata", {}).get("total_errors", 0)
+        total_correct = existing.get("metadata", {}).get("total_correct", 0)
+    else:
+        # Start fresh collection
+        logger.info("Starting fresh collection")
+        error_cases = []
+        charge_count = {}
+        for c in charge_names:
+            charge_count[clean_charge(c)] = 0
+        total_processed = 0
+        total_errors = 0
+        total_correct = 0
     
     total_charges = len(charge_count)
-    logger.info(f"[断点续收集] 并发线程数: {max_workers}，继续收集...")
+    logger.info(f"Target: {per_charge_target} error cases per charge, {total_charges} total charges")
+    logger.info(f"Parallel workers: {max_workers}")
     
-    random.shuffle(filtered_test_data)
+    # Filter out completed charges initially
+    remaining_data = filter_remaining_cases(train_data, charge_count, per_charge_target)
     
-    # 检查是否已全部完成
+    # Shuffle
+    random.shuffle(remaining_data)
+    
+    # Check if done
     def all_charges_done():
         return all(cnt >= per_charge_target for cnt in charge_count.values())
     
-    batch_size = max_workers * 5
+    if all_charges_done():
+        logger.info("🎉 All charges completed!")
+        return
+    
     done = False
+    batch_size = max_workers * 5
+    current_idx = 0
     
     if has_tqdm:
-        pbar = tqdm(total=len(filtered_test_data), desc="Remaining cases processed")
+        pbar = tqdm(total=len(remaining_data), desc="Cases processed")
     else:
         pbar = None
     
-    i = 0
-    while i < len(filtered_test_data) and not done:
-        batch_end = min(i + batch_size, len(filtered_test_data))
-        batch = filtered_test_data[i:batch_end]
+    # ========== Main loop: dynamic batching ==========
+    while current_idx < len(remaining_data) and not done:
+        # Get current batch
+        batch_end = min(current_idx + batch_size, len(remaining_data))
+        batch = remaining_data[current_idx:batch_end]
         
-        logger.info(f"处理批次: {len(batch)} 个剩余案件 (已处理 {i}/{len(filtered_test_data)})")
+        if not batch:
+            # No more cases to process
+            break
         
-        # 并行处理
+        logger.info(f"Processing batch: {len(batch)} cases ({current_idx}/{len(remaining_data)})")
+        
+        # Parallel process current batch
         with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
             futures = []
             for item in batch:
@@ -340,24 +356,36 @@ def resume_collect(
                     model_name,
                     charge_names,
                     article_names,
-                    charge_count,
-                    per_charge_target,
                 )
                 futures.append(future)
             
+            # Collect results
             for future in as_completed(futures):
                 total_processed += 1
                 result = future.result()
                 
-                if result is None:
+                if result is None or result["type"] == "failed":
                     continue
                 
                 if result["type"] == "correct":
                     total_correct += 1
-                    pass
-                elif result["type"] == "error_needed":
+                    continue
+                
+                elif result["type"] == "error":
+                    # Prediction error, check if we still need this charge
                     total_errors += 1
-                    logger.info(f"发现新错误案例：真实={sorted(result['true_charges'])}, 预测={sorted(result['predicted_charges'])}")
+                    need_this = False
+                    for c in result["true_charges"]:
+                        if charge_count.get(c, 0) < per_charge_target:
+                            need_this = True
+                            break
+                    
+                    if not need_this:
+                        logger.info(f"Skip: all charges in this case are already full")
+                        continue
+                    
+                    # Found needed error -> extract error reason
+                    logger.info(f"Found valid error: true={sorted(result['true_charges'])}, pred={sorted(result['predicted_charges'])}")
                     
                     error_reason = extract_error_reason(
                         client,
@@ -365,8 +393,10 @@ def resume_collect(
                         result["fact"],
                         result["true_charges"],
                         result["predicted_charges"],
+                        result["predicted_judgment"],
                     )
                     
+                    # Build error case
                     error_case = {
                         "fact": result["fact"],
                         "error_reason": error_reason,
@@ -381,90 +411,95 @@ def resume_collect(
                     
                     error_cases.append(error_case)
                     
-                    # 更新计数
+                    # Update count
                     for c in result["true_charges"]:
                         if c in charge_count:
                             charge_count[c] += 1
                     
-                    # 即时保存
+                    # Save immediately
                     with open(output_file, 'w', encoding='utf-8') as f:
                         json.dump({
-                            "count": len(error_cases),
-                            "error_cases": error_cases,
                             "metadata": {
-                                "mode": "bare_llm_parallel_resumed",
+                                "mode": "negative_kb_bare_llm",
+                                "count": len(error_cases),
                                 "total_processed": total_processed,
                                 "total_errors": total_errors,
                                 "total_correct": total_correct,
                                 "per_charge_target": per_charge_target,
                                 "charge_count": charge_count,
                                 "max_workers": max_workers,
-                                "resumed_from": existing_result_path,
-                            }
+                                "resumed_from": resume_from,
+                            },
+                            "count": len(error_cases),
+                            "error_cases": error_cases,
                         }, f, ensure_ascii=False, indent=2)
                     
                     still_need = [c for c, cnt in charge_count.items() if cnt < per_charge_target]
-                    logger.info(f"已保存，剩余 {len(still_need)} 个罪名还需要收集")
+                    logger.info(f"Saved, {len(still_need)} charges still need more errors")
                     
+                    # Check if done
                     if all_charges_done():
-                        logger.info("🎉 所有罪名都已收集完成！")
+                        logger.info("🎉 All charges completed!")
                         done = True
                         break
-                
-                elif result["type"] == "error":
-                    pass
         
-        i = batch_end
+        # Update index and progress bar
         if pbar:
-            pbar.update(batch_end - i)
+            pbar.update(batch_end - current_idx)
+        current_idx = batch_end
         
-        if done:
-            break
+        # Re-filter after batch: remove any newly completed charges
+        # This ensures next batch only processes needed cases
+        if not done:
+            remaining_data = filter_remaining_cases(remaining_data[current_idx:], charge_count, per_charge_target)
+            current_idx = 0
+            random.shuffle(remaining_data)
     
     if pbar:
         pbar.close()
     
-    # 最终保存
+    # ========== 最终保存 ==========
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump({
-            "count": len(error_cases),
-            "error_cases": error_cases,
             "metadata": {
-                "mode": "bare_llm_parallel_resumed",
+                "mode": "negative_kb_bare_llm",
+                "count": len(error_cases),
                 "total_processed": total_processed,
                 "total_errors": total_errors,
                 "total_correct": total_correct,
                 "per_charge_target": per_charge_target,
                 "charge_count": charge_count,
                 "max_workers": max_workers,
-                "resumed_from": existing_result_path,
+                "resumed_from": resume_from,
                 "error_rate": total_errors / total_processed if total_processed > 0 else 0,
                 "done_charges": sum(1 for cnt in charge_count.values() if cnt >= per_charge_target),
                 "total_charges": total_charges,
-            }
+            },
+            "count": len(error_cases),
+            "error_cases": error_cases,
         }, f, ensure_ascii=False, indent=2)
     
-    # 输出统计
+    # Final summary
     logger.info("=" * 70)
-    logger.info(f"断点续收集完成！")
-    logger.info(f"  累计处理案件: {total_processed}")
-    logger.info(f"  累计错误案例: {len(error_cases)}")
+    logger.info(f"Collection completed!")
+    logger.info(f"  Total cases processed: {total_processed}")
+    logger.info(f"  Total error cases collected: {len(error_cases)}")
     done_count = sum(1 for cnt in charge_count.values() if cnt >= per_charge_target)
-    logger.info(f"  完成罪名: {done_count}/{total_charges} (每个{per_charge_target}个)")
+    logger.info(f"  Charges completed: {done_count}/{total_charges} ({per_charge_target} each)")
     incomplete = [(c, cnt) for c, cnt in charge_count.items() if cnt < per_charge_target]
     if incomplete:
         if len(incomplete) <= 20:
-            logger.info(f"  未完成: {incomplete}")
+            logger.info(f"  Incomplete: {incomplete}")
         else:
-            logger.info(f"  未完成: {len(incomplete)} 个罪名 (其中: {incomplete[:10]}...)")
-    logger.info(f"  错误率: {total_errors / total_processed * 100:.2f}%" if total_processed > 0 else "N/A")
-    logger.info(f"  并发线程数: {max_workers}")
-    logger.info(f"  保存位置: {output_file}")
+            logger.info(f"  Incomplete: {len(incomplete)} charges (first 10: {incomplete[:10]}...)")
+    logger.info(f"  Error rate: {total_errors / total_processed * 100:.2f}%" if total_processed > 0 else "N/A")
+    logger.info(f"  Parallel workers: {max_workers}")
+    logger.info(f"  Saved to: {output_file}")
     logger.info("=" * 70)
 
 
 def load_api_config(config: dict):
-    """加载API配置"""
+    """Load API configuration from config"""
     api_config = config.get("api", {})
     base_url = api_config.get("base_url")
     api_key_env = api_config.get("api_key_env", "DEEPSEEK_API_KEY")
@@ -485,29 +520,36 @@ def load_api_config(config: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='[断点续收集] 继续收集裸LLM判错案例')
-    parser.add_argument('--config', type=str, default='config.json', help='配置文件路径')
-    parser.add_argument('--from', dest='existing_result', required=True, help='已有的收集结果json文件（继续收集的起点）')
-    parser.add_argument('--test-file', type=str, default=None, help='原测试数据文件路径，覆盖配置')
-    parser.add_argument('--per-charge', type=int, default=3, help='每个罪名目标多少个错误')
-    parser.add_argument('--output', type=str, default=None, help='输出文件路径，默认覆盖原文件')
-    parser.add_argument('--max-workers', type=int, default=10, help='并发线程数')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser = argparse.ArgumentParser(description='Collect error cases for negative knowledge base')
+    parser.add_argument('--config', type=str, default='config.json', help='Config file path')
+    parser.add_argument('--train-file', type=str, default=None, help='Training data file path')
+    parser.add_argument('--per-charge', type=int, default=None, help='Number of error cases per charge')
+    parser.add_argument('--output', type=str, default=None, help='Output knowledge base path')
+    parser.add_argument('--max-workers', type=int, default=None, help='Parallel workers, adjust by API rate limit')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed')
+    parser.add_argument('--resume-from', type=str, default=None, help='Resume from existing checkpoint')
     args = parser.parse_args()
     
-    # 读取配置
+    # Read config
     with open(args.config, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # 加载API配置
+    # Load API config
     base_url, api_key, model_name = load_api_config(config)
     
-    # 初始化客户端
+    # Get collection config from config, command line args override
+    collect_config = config.get("collection", {})
+    per_charge = args.per_charge or collect_config.get("per_charge", 3)
+    output = args.output or collect_config.get("output", "data/negative_error_cases/negative_kb_bare_llm.json")
+    max_workers = args.max_workers or collect_config.get("max_workers", 10)
+    seed = args.seed or collect_config.get("seed", 42)
+    
+    # Initialize client
     os.environ['HTTP_PROXY'] = ''
     os.environ['HTTPS_PROXY'] = ''
     client = OpenAI(base_url=base_url, api_key=api_key)
     
-    # 加载标签映射（所有罪名列表）
+    # Load charge and article lists
     charge_path = os.path.join(os.path.dirname(__file__), 'data/cail2018/baseline/accu.txt')
     charge_names = []
     if os.path.exists(charge_path):
@@ -521,33 +563,29 @@ def main():
             article_names = [line.strip() for line in f if line.strip()]
     
     if not charge_names:
-        raise ValueError("找不到罪名列表，请检查文件: " + charge_path)
+        raise ValueError("Charge list not found at: " + charge_path)
     
-    # 加载原始测试数据
-    eval_config = config.get("evaluation", {})
-    test_file = args.test_file or eval_config.get("test_file", 'data/final_all_data/first_stage/test.json')
+    # Load training data
+    train_file = args.train_file or collect_config.get("train_file", 'data/final_all_data/first_stage/train.json')
     
-    random.seed(args.seed)
-    original_test_data = load_cail2018(test_file)
-    logger.info(f"加载原始测试数据完成，共 {len(original_test_data)} 个案件")
+    random.seed(seed)
+    train_data = load_cail2018(train_file)
+    logger.info(f"Loaded {len(train_data)} training cases")
     
-    # 输出文件默认覆盖原文件
-    output_file = args.output or args.existing_result
+    # Create output directory
+    os.makedirs(os.path.dirname(output), exist_ok=True)
     
-    # 创建输出目录
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
-    # 开始断点续收集
-    resume_collect(
+    # Start collection
+    collect_error_cases(
         client,
         model_name,
-        original_test_data,
-        args.existing_result,
+        train_data,
         charge_names,
         article_names,
-        output_file,
-        per_charge_target=args.per_charge,
-        max_workers=args.max_workers,
+        output,
+        per_charge_target=per_charge,
+        max_workers=max_workers,
+        resume_from=args.resume_from,
     )
 
 
