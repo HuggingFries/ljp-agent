@@ -1,0 +1,12 @@
+"api":
+  "base_url": "https://api.deepseek.com/v1"
+  "api_key": "DEEPSEEK_API_KEY" # DEEPSEEK_API_KEY/OPENAI_API_KEY/paste your API key here
+  "model_name": "deepseek-chat"
+"data":
+  "accu_path": "data/accu.txt"
+  "law_path": "data/law.txt"
+"test":
+  "seed": 42
+  "max_samples": 100
+  "test_file": "data/final_all_data/first_stage/test.json"
+  "result_dir": "results"

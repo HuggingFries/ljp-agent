@@ -1,0 +1,31 @@
+# Cluster error reasons clustering config
+
+# Embedding model settings
+# Legal domain fine-tuned model: Lawformer from thunlp/Lawformer
+embedding_model_name: "thunlp/Lawformer"
+embedding_device: "cpu"
+
+# HDBSCAN clustering settings
+# - min_cluster_size: minimum number of points in a cluster (smaller = more small clusters allowed)
+# - min_samples: controls how conservative clustering is (lower = less conservative, more clusters)
+# - cluster_selection_epsilon: distance threshold for cluster selection (larger = allows more clusters with larger distance)
+hdbscan_min_cluster_size: 3
+hdbscan_min_samples: 2
+hdbscan_cluster_selection_epsilon: 0.3
+
+# LLM summarization settings
+# For DeepSeek, use provider: openai, model: deepseek-chat, and set DEEPSEEK_API_KEY env var
+# DeepSeek API is compatible with OpenAI interface
+llm_provider: "openai"
+llm_model: "deepseek-chat"
+llm_max_concurrent: 5
+llm_temperature: 0.3
+
+# Number of closest samples to send to LLM for summarization
+# Too large may exceed token limit, too small may lead to bad summary
+samples_per_cluster_for_summary: 8
+
+# Input/output paths
+input_path: "data/negative_error_cases/collected_errors_with_reasons.json"
+output_path: "data/negative_error_cases/clustered_error_reasons.json"
+summary_output_path: "data/negative_error_cases/error_reason_clusters_summary.md"

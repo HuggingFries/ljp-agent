@@ -4,9 +4,17 @@ Pure LLM baseline for LJP, no RAG enhancement.
 Same API interface as LJPRAGAgent for direct comparison.
 
 Usage:
+1. Import and use in code:
   from baseline import LJPBaseline
   baseline = LJPBaseline(config_path="config.json")
   prediction = baseline.predict(fact_text)
+
+2. Run as script for quick test:
+  python src/baseline/baseline.py [options]
+
+  [options]
+    --config CONFIG_PATH   Path to config yaml file (default: config/config.yaml)
+    --fact FACT_PATH       Path to input fact text file (default: data/sample.txt)
 """
 
 import json
@@ -20,7 +28,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 CURRENT_DIR = Path(__file__).resolve().parent
-ROOT_DIR = CURRENT_DIR.parent
+ROOT_DIR = CURRENT_DIR.parent.parent
 
 BASELINE_PROMPT = """你是一位专业的中国法官，请你根据以下案件事实，判决被告人的罪名和相关法条。
 
@@ -170,19 +178,25 @@ def main():
     logging.basicConfig(level=logging.INFO)
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.json", help="Config file path")
-    parser.add_argument("--fact", help="Input fact text file", required=True)
+    parser.add_argument("--config", default="config/config.yaml", help="Config file path")
+    parser.add_argument("--fact", default=f"{ROOT_DIR}/data/sample.txt", help="Input fact text file")
     args = parser.parse_args()
     
     with open(args.fact, 'r', encoding='utf-8') as f:
         fact = f.read()
+
+    if not fact or not fact.strip():
+        raise ValueError("Input fact is empty. Cannot make a meaningful prediction.")
     
     baseline = LJPBaseline(config_path=args.config)
     result = baseline.predict(fact)
     
     print("\n" + "="*50)
+    print("Input Fact:\n")
+    print(fact)
+    print("\n" + "="*50)
     print("Baseline Prediction Result:")
-    print(f"  Prediction: {result['pred_charge']}")
+    print(f"  Charges: {result['pred_charges']}")
     print(f"  Articles: {result['pred_articles']}")
     print(f"  Total tokens: {result['total_tokens']}")
     print("="*50 + "\n")
