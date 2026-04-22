@@ -4,6 +4,8 @@ RAG Agent main logic for LJP negative example enhancement.
 Extracts legal elements from input case, retrieves similar negative cases,
 injects error information into prompt, and runs final prediction.
 
+Workflow: xxx
+
 Usage:
 1. Import and use in code:
     from agent import LJPRAGAgent
@@ -11,29 +13,34 @@ Usage:
     prediction = agent.predict(fact_text)
 
 2. Run as script for quick test:
-    python agent.py [options]
+    python src/agent/agent.py [options]
 
     [options]
+        --config CONFIG_PATH   Path to config yaml file (default: config/config.yaml)
+        --fact FACT_PATH       Path to input fact text file (default: data/sample.txt)
+        --top-k TOP_K          Number of negative cases to retrieve (default: 3)
+        --device DEVICE        Device for embedding model (default: cpu)
     
 """
 
 import json
+import yaml
 import os
 import logging
+from tkinter import CURRENT
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
+from pathlib import Path
 from element_extractor import LegalElementExtractor
 from retriever import LJPRetriever
 
 logger = logging.getLogger(__name__)
 
-
-# Element extraction is now handled by independent element_extractor.py
-# Prompt kept here for reference, code moved to element_extractor
-
+CURRENT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURRENT_DIR.parent.parent
 
 RAG_PREDICTION_PROMPT = """你是一位专业的中国法官，请你根据以下案件事实，结合参考错例，判决被告人的罪名和相关法条。
-以下提供的是**过往模型在类似案件中被判错的真实案例**，它们与当前案件事实相似，请你仔细阅读并吸取前车之鉴，避免重蹈覆辙。
+以下提供的是**过往模型在类似案件中被判错的真实案例**，它们与当前案件事实相似，请你仔细阅读并吸取前车之鉴，避免重蹈覆辙。当然，如果你认为没有参考价值，可以不必强行使用它们。
 
 **重要要求：**
 1. 你只能从下面给定的候选罪名列表中选择，被告人可以犯**一罪或数罪**，不允许输出列表外的罪名
@@ -51,6 +58,7 @@ RAG_PREDICTION_PROMPT = """你是一位专业的中国法官，请你根据以�
 案件事实：
 {fact}
 
+检索到的历史上被判错的参考案例信息：
 {retrieved_negatives}
 
 请输出JSON：
@@ -69,7 +77,7 @@ class LJPRAGAgent:
     
     def __init__(
         self,
-        config_path: str = "config.json",
+        config_path: str = None,
         device: str = "cpu",
     ):
         """
@@ -79,14 +87,18 @@ class LJPRAGAgent:
             config_path: Path to config json file
             device: Device for embedding model in retriever
         """
+        if config_path is not None:
+            config_path = ROOT_DIR / "config" / "config.yaml"
         with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = json.load(f)
+            self.config = yaml.safe_load(f)
         
         # Load accusation list and law list
-        self.accusations = self._load_label_file("data/accu.txt")
-        self.laws = self._load_label_file("data/law.txt")
-        logger.info(f"Loaded {len(self.accusations)} candidate accusations from data/accu.txt")
-        logger.info(f"Loaded {len(self.laws)} candidate laws from data/law.txt")
+        self.accu_path = ROOT_DIR / self.config["data"]["accu_path"]
+        self.law_path = ROOT_DIR / self.config["data"]["law_path"]
+        self.accu = self._load_label_file(self.accu_path)
+        self.law = self._load_label_file(self.law_path)
+        logger.info(f"Loaded {len(self.accu)} candidate accusations from {self.accu_path}")
+        logger.info(f"Loaded {len(self.law)} candidate laws from {self.law_path}")
         
         # Initialize OpenAI client (DeepSeek compatible)
         api_key = self._get_api_key()
@@ -106,7 +118,7 @@ class LJPRAGAgent:
             device=device,
         )
         
-        logger.info("✅ LJPRAGAgent initialized successfully")
+        logger.info("Done! LJPRAGAgent initialized successfully")
     
     def _load_label_file(self, path: str) -> List[str]:
         """Load label list from text file (one label per line)."""
@@ -130,7 +142,7 @@ class LJPRAGAgent:
         
         if not key:
             raise ValueError(
-                "API key not found. Please set OPENAI_API_KEY or DEEPSEEK_API_KEY environment variable.\n"
+                "API key not found. Please set OPENAI_API_KEY or DEEPSEEK_API_KEY environment variable or paste the key into the config file.\n"
                 f"Config expects {api_key_env} from config."
             )
         return key
@@ -148,7 +160,7 @@ class LJPRAGAgent:
         """
         return self.element_extractor.extract(fact)
     
-    def format_negative_info(self, retrieved_negatives: List[Dict[str, Any]]) -> str:
+    def format_negative_info(self, retrieved_negatives: List[Dict[str, Any]], layer="L2") -> str:
         """
         Format retrieved negative cases for prompt injection.
         Inject L0 (full original case) layer.
@@ -162,26 +174,62 @@ class LJPRAGAgent:
         if not retrieved_negatives:
             return ""
         
-        parts = ["参考错例：以下是与本案相似、但曾被错误判决的案例，请认真吸取教训，避免犯同样的错误：\n"]
+        parts = ["参考错例：以下是与本案相似、但曾被错误判决的案例，请认真吸取教训，避免犯同样的错误（如果某些案件不具有参考性，可以忽略，不必强行参考）：\n"]
         for i, case in enumerate(retrieved_negatives, 1):
-            L0 = case.get("L0", {})
+            L0 = case.get("L0", {}) # original info
+            L1 = case.get("L1", {}) # extracted elements
+            L2 = case.get("L2", {}) # error analysis 1
+            L3 = case.get("L3", {}) # error analysis 2
+
+            parts.append(f"### 错例 {i}:\n")
             
+            # L0 layer
             fact = L0.get("fact", "")
             error_reason = L0.get("error_reason", "")
-            predicted_charge = L0.get("predicted_charge", "")
-            true_charge = L0.get("true_charge", "")
+            pred_charge_list = L0.get("predicted_charge", [])
+            true_charge_list = L0.get("true_charge", [])
+            pred_article_list = L0.get("predicted_article", [])
+            true_article_list = L0.get("true_article", [])
+            # L1 layer
+            legal_elements = L1.get("case_legal_elements", {})
+            error_involved_elements_list = L1.get("error_involved_elements", [])
+            # L2 layer
+            core_error_summary = L2.get("core_error_summary", "")
+            warning = L2.get("warning", "")
+            golded_rule = L2.get("golded_rule", "")
+            # L3 layer(not used for now, added later)
             
-            parts.append(f"### 错例 {i}:\n")
-            if fact:
+            if 'L0' in layer:
                 parts.append(f"**案件事实**：\n{fact}\n")
-            if predicted_charge:
-                parts.append(f"- **错误判决**：{predicted_charge}")
-            if true_charge:
+
+                pred_charge = ";".join(pred_charge_list)
+                true_charge = ";".join(true_charge_list)
+                pred_article = ";".join(pred_article_list)
+                true_article = ";".join(true_article_list)
+
+                parts.append(f"- **错误判决**：{pred_charge}")
                 parts.append(f"- **正确判决**：{true_charge}")
-            if error_reason:
+                parts.append(f"- **错误相关法条**：{pred_article}")
+                parts.append(f"- **正确相关法条**：{true_article}")
+
                 parts.append(f"- **错误原因**：{error_reason}")
-            parts.append("")
-        
+
+            if 'L1' in layer:
+                parts.append(f"**案件七要素**：")
+
+                for name, value in legal_elements.items():
+                    parts.append(f"  - {name}：{value}")
+                error_involved_elements = ", ".join(error_involved_elements_list)
+                parts.append(f"**涉及错误的要素**：{error_involved_elements}")
+
+            if 'L2' in layer:
+                parts.append(f"**核心错误总结**：{core_error_summary}")
+                parts.append(f"**对法官的警示**：{warning}")
+                parts.append(f"**金科玉律（如果有的话）**：{golded_rule}")
+            
+            if 'L3' in layer:
+                pass  # Added later
+
         return "\n".join(parts)
     
     def predict(
@@ -212,12 +260,12 @@ class LJPRAGAgent:
         retrieved_negatives = self.retriever.retrieve_negative(fact, elements, top_k)
         
         # Step 3: Format negative information for prompt
-        formatted_negatives = self.format_negative_info(retrieved_negatives)
+        formatted_negatives = self.format_negative_info(retrieved_negatives, layer="L0L2")
         
         # Step 4: Run final prediction
         # Join accusations and laws into strings
-        accu_text = "\n".join([f"- {accu}" for accu in self.accusations])
-        law_text = "\n".join([f"- {law}" for law in self.laws])
+        accu_text = "\n".join([f"- {accu}" for accu in self.accu])
+        law_text = "\n".join([f"- {law}" for law in self.law])
         prompt = RAG_PREDICTION_PROMPT.format(
             fact=fact,
             retrieved_negatives=formatted_negatives,
@@ -256,7 +304,7 @@ class LJPRAGAgent:
                 pred_charges = []
                 pred_articles = []
         
-        logger.info(f"✅ Prediction done: charges={pred_charges}, articles={pred_articles}, tokens={total_tokens}")
+        logger.info(f"Prediction done: charges={pred_charges}, articles={pred_articles}, tokens={total_tokens}")
         
         return {
             "prediction": pred_charges[0] if len(pred_charges) > 0 else "",  # For backward compatibility
@@ -277,8 +325,8 @@ def main():
     logging.basicConfig(level=logging.INFO)
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.json", help="Config file path")
-    parser.add_argument("--fact", help="Input fact text file", required=True)
+    parser.add_argument("--config", default=ROOT_DIR / "config" / "config.yaml", help="Config file path")
+    parser.add_argument("--fact", help="Input fact text file", default=ROOT_DIR / "data" / "sample.txt")
     parser.add_argument("--top-k", type=int, default=3, help="Number of negative cases")
     parser.add_argument("--device", default="cpu", help="Device")
     args = parser.parse_args()
@@ -291,9 +339,12 @@ def main():
     
     print("\n" + "="*50)
     print("Prediction Result:")
-    print(f"  Prediction: {result['pred_charge']}")
+    print(f"  Prediction: {result['pred_charges']}")
     print(f"  Articles: {result['pred_articles']}")
     print(f"  Total tokens: {result['total_tokens']}")
+    print(f"  Extracted elements: {result['elements']}")
+    print(f"  Retrieved negatives: {result['retrieved_negatives']}")
+    print(f"  Prompt:\n{result['prompt']}")
     print("="*50 + "\n")
 
 
