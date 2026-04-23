@@ -10,3 +10,11 @@
   "max_samples": 100
   "test_file": "data/final_all_data/first_stage/test.json"
   "result_dir": "results"
+"retriever":
+  "index_root": "data/index_hierarchical"
+  "negative":
+    "elements_weight": 0.7
+    "fact_weight": 0.3
+    "top_k": 3
+"index":
+  "embedding_model": "uer/sbert-base-chinese-nli"
