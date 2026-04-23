@@ -179,7 +179,6 @@ def evaluate_model(
     output_dir: str,
     experiment_name: str,
     use_rag: bool = False,
-    cumulative_step: int = 10,
 ) -> Dict[str, Any]:
     """
     Generic test function for any model with .predict() method.
@@ -188,6 +187,7 @@ def evaluate_model(
     total_samples = len(test_data)
     charge_correct = 0
     article_correct = 0
+    joint_correct = 0
     total_article_samples = 0
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -211,6 +211,8 @@ def evaluate_model(
                     total_article_samples += 1
                     if res["article_correct"]:
                         article_correct += 1
+                if res["charge_correct"] and (not res["has_article"] or res["article_correct"]):
+                    joint_correct += 1
                 total_prompt_tokens += res["prompt_tokens"]
                 total_completion_tokens += res["completion_tokens"]
                 total_tokens += res["total_tokens"]
@@ -223,7 +225,7 @@ def evaluate_model(
 
     charge_accuracy = charge_correct / total_samples if total_samples > 0 else 0.0
     article_accuracy = article_correct / total_article_samples if total_article_samples > 0 else 1.0
-    combined_accuracy = (charge_accuracy + article_accuracy) / 2
+    joint_accuracy = joint_correct / total_samples if total_samples > 0 else 0.0
 
     # Save predictions
     os.makedirs(output_dir, exist_ok=True)
@@ -235,7 +237,7 @@ def evaluate_model(
     return {
         "charge_accuracy": charge_accuracy,
         "article_accuracy": article_accuracy,
-        "combined_accuracy": combined_accuracy,
+        "joint_accuracy": joint_accuracy,
         "total_samples": total_samples,
         "total_article_samples": total_article_samples,
         "charge_correct": charge_correct,
@@ -271,7 +273,7 @@ def run_baseline(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, 
         wandb.log({
             "final_charge_acc": metrics["charge_accuracy"],
             "final_article_acc": metrics["article_accuracy"],
-            "final_combined_acc": metrics["combined_accuracy"],
+            "final_joint_acc": metrics["joint_accuracy"],
             "total_samples": metrics["total_samples"],
             "total_prompt_tokens": metrics["total_prompt_tokens"],
             "total_completion_tokens": metrics["total_completion_tokens"],
@@ -311,7 +313,7 @@ def run_rag(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
         wandb.log({
             "final_charge_acc": metrics["charge_accuracy"],
             "final_article_acc": metrics["article_accuracy"],
-            "final_combined_acc": metrics["combined_accuracy"],
+            "final_joint_acc": metrics["joint_accuracy"],
             #"top_k": args.top_k,
             "total_samples": metrics["total_samples"],
             #"total_prompt_tokens": metrics["total_prompt_tokens"],

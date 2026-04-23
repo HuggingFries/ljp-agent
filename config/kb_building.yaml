@@ -1,0 +1,21 @@
+# Configuration for negative knowledge base construction
+
+collection:
+  # Number of error cases to collect per charge
+  per_charge: 3
+  # Output path for collected raw error cases (L0 layer)
+  output: "data/negative_error_cases/collected_errors.json"
+  # Number of parallel API workers
+  max_workers: 10
+  # Random seed for shuffling
+  seed: 42
+  # Path to training data file
+  train_file: "data/final_all_data/first_stage/train.json"
+
+hierarchical_build:
+  # Input raw collected errors from collection step
+  input: "data/negative_error_cases/collected_errors.json"
+  # Output hierarchical KB with L1/L2/L3
+  output: "data/negative_error_cases/collected_errors_hierarchical.json"
+  # Number of parallel API workers
+  max_workers: 10
