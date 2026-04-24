@@ -211,7 +211,7 @@ class LJPRAGAgent:
             true_articles = ";".join(true_article_list)
             
             if 'L0' in layer:
-                parts.append("以下是该错例的元信息")
+                #parts.append("以下是该错例的元信息")
                 parts.append(f"**案件事实**：\n{fact}\n")
 
                 parts.append(f"- **错误判决**：{pred_charges}")
@@ -222,13 +222,13 @@ class LJPRAGAgent:
                 parts.append(f"- **判决原因**：{pred_reasoning}")
 
             if 'L1' in layer:
-                parts.append("以下是该错例案件事实的七要素：")
+                #parts.append("以下是该错例案件事实的七要素：")
                 parts.append(f"**案件七要素**：")
                 for name, value in legal_elements.items():
                     parts.append(f"  - {name}：{value}")
 
             if 'L2' in layer:
-                parts.append("以下是针对该错例的具体分析：")
+                #parts.append("以下是针对该错例的具体分析：")
                 parts.append(f"**案件关键事实概括**：{case_summary}")
                 parts.append(f"**应该判处{true_charges}和引用{true_articles}的原因**：{correct_reasoning}")
                 parts.append(f"**不该判处{pred_charges}和引用{pred_articles}的原因**：{wrong_reasoning}")
@@ -236,7 +236,7 @@ class LJPRAGAgent:
                 parts.append(f"**该案例的争议度评分（0-1）分，分数越低表示该案例越具有参考价值，越高表示争议越大）**：{controversy_score}")
             
             if 'L3' in layer:
-                parts.append("以下是从该错例中提取的较为普适的经验/教训/提示")
+                #parts.append("以下是从该错例中提取的较为普适的经验/教训/提示")
                 parts.append(f"**经验教训总结**：{experience}")
                 parts.append(f"**对本案的启示**：{lesson}")
                 parts.append(f"**给法官的提示**：{hint}")
@@ -271,7 +271,7 @@ class LJPRAGAgent:
         retrieved_negatives = self.retriever.retrieve_negative(fact, elements, top_k)
         
         # Step 3: Format negative information for prompt
-        formatted_negatives = self.format_negative_info(retrieved_negatives, layer="L2L3")  # You can choose which layers to include in the prompt
+        formatted_negatives = self.format_negative_info(retrieved_negatives, layer="L2")  # You can choose which layers to include in the prompt
         
         # Step 4: Run final prediction
         # Join accusations and laws into strings
