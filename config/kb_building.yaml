@@ -17,5 +17,6 @@ hierarchical_build:
   input: "data/negative_error_cases/collected_errors.json"
   # Output hierarchical KB with L1/L2/L3
   output: "data/negative_error_cases/collected_errors_hierarchical.json"
+  output_multi: "data/negative_error_cases/collected_errors_hierarchical_multi.json"
   # Number of parallel API workers
   max_workers: 10

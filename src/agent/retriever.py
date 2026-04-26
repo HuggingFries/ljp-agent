@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Retriever implementation for LJP-RAG negative example enhancement.
-Only implements current recommended approach: elements-weighted retrieval.
-Negative KB: only L1 layer (fact elements) is embedded for retrieval.
-Target: weighted combination of extracted legal elements (high weight) + original fact (low weight).
+Retriever implementation for LJP-RAG negative/positive example retrieval.
+Supports:
+- Negative KB: L1 layer (fact elements) is embedded, weighted combination with original fact.
+- Positive KB: same embedding strategy.
 
 Usage:
-  Import as module:
     from retriever import LJPRetriever
-    retriever = LJPRetriever(config_path="config.json")
-    results = retriever.retrieve_negative(target_fact, target_elements, top_k=k)
+    retriever = LJPRetriever(config_path="config.yaml")
+    neg_results = retriever.retrieve(target_fact, target_elements, top_k=3, index_type='negative')
+    pos_results = retriever.retrieve(target_fact, target_elements, top_k=3, index_type='positive')
+    # or using convenience methods
+    neg_results = retriever.retrieve_negative(target_fact, target_elements, top_k=3)
+    pos_results = retriever.retrieve_positive(target_fact, target_elements, top_k=3)
 """
 
 import json
-from tkinter import CURRENT
 import yaml
 import os
 import numpy as np
@@ -29,8 +31,9 @@ ROOT_DIR = CURRENT_DIR.parent.parent
 
 class LJPRetriever:
     """
-    Main retriever class for LJP-RAG negative knowledge base.
-    Implements elements-weighted retrieval: only L1 layer embedded, weighted target combination.
+    Retriever for LJP-RAG knowledge base.
+    Supports both negative (error cases) and positive (correct cases) retrieval.
+    Loads both indices at initialization.
     """
     
     def __init__(
@@ -41,12 +44,12 @@ class LJPRetriever:
         device: str = "cpu",
     ):
         """
-        Initialize retriever from config or explicit parameters.
+        Initialize retriever. Loads both negative and positive indices.
         
         Args:
-            config_path: Path to config json file
-            index_root: Override index root directory from config
-            embedding_model: Override embedding model name from config
+            config_path: Path to config YAML file
+            index_root: Override index root directory
+            embedding_model: Override embedding model name
             device: Device to run embedding model on
         """
         if config_path is None:
@@ -56,7 +59,7 @@ class LJPRetriever:
             self.config = yaml.safe_load(f)
         
         self.index_root = index_root or self.config["retriever"]["index_root"]
-        self._load_negative_index()
+        self._load_indices()
         
         # Initialize embedding model
         model_name = embedding_model or self.config["index"]["embedding_model"]
@@ -64,34 +67,41 @@ class LJPRetriever:
         self.embedding_model = SentenceTransformer(model_name, device=device)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
         logger.info(f"Embedding model loaded, dimension: {self.embedding_dim}")
-        
-        # Element extraction is done by caller (agent/test script) using independent tool
-        # We don't initialize extractor here, caller passes extracted elements to us
     
-    def _load_negative_index(self) -> None:
-        """Load pre-built negative hierarchical index from disk."""
-        cases_path = os.path.join(self.index_root, "neg_hierarchical_cases.json")
-        embeddings_path = os.path.join(self.index_root, "neg_l1_embeddings.npy")
-        meta_path = os.path.join(self.index_root, "neg_metadata.json")
+    def _load_indices(self) -> None:
+        """Load both negative and positive indices from disk."""
+        # Negative index
+        neg_cases_file = os.path.join(self.index_root, "neg_hierarchical_cases.json")
+        neg_embeddings_file = os.path.join(self.index_root, "neg_l1_embeddings.npy")
+        neg_meta_file = os.path.join(self.index_root, "neg_metadata.json")
         
-        for path in [cases_path, embeddings_path, meta_path]:
+        for path in [neg_cases_file, neg_embeddings_file, neg_meta_file]:
             if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"Negative index file not found: {path}\n"
-                    f"Did you run build_hierarchical_index.py first?"
-                )
+                raise FileNotFoundError(f"Negative index file not found: {path}")
         
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            self.neg_meta = json.load(f)
-        
-        with open(cases_path, 'r', encoding='utf-8') as f:
+        with open(neg_meta_file, 'r', encoding='utf-8') as f:
+            self.neg_metadata = json.load(f)
+        with open(neg_cases_file, 'r', encoding='utf-8') as f:
             self.neg_cases = json.load(f)
+        self.neg_embeddings = np.load(neg_embeddings_file)
         
-        self.neg_l1_embeddings = np.load(embeddings_path)
+        # Positive index
+        pos_cases_file = os.path.join(self.index_root, "pos_hierarchical_cases.json")
+        pos_embeddings_file = os.path.join(self.index_root, "pos_l1_embeddings.npy")
+        pos_meta_file = os.path.join(self.index_root, "pos_metadata.json")
         
-        logger.info(f"Loaded negative index from {self.index_root}:")
-        logger.info(f"  Number of negative cases: {len(self.neg_cases)}")
-        logger.info(f"  Embedding shape: {self.neg_l1_embeddings.shape}")
+        for path in [pos_cases_file, pos_embeddings_file, pos_meta_file]:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Positive index file not found: {path}")
+        
+        with open(pos_meta_file, 'r', encoding='utf-8') as f:
+            self.pos_metadata = json.load(f)
+        with open(pos_cases_file, 'r', encoding='utf-8') as f:
+            self.pos_cases = json.load(f)
+        self.pos_embeddings = np.load(pos_embeddings_file)
+        
+        logger.info(f"Loaded negative index: {len(self.neg_cases)} cases, embeddings shape {self.neg_embeddings.shape}")
+        logger.info(f"Loaded positive index: {len(self.pos_cases)} cases, embeddings shape {self.pos_embeddings.shape}")
     
     def _compute_target_embedding(
         self,
@@ -99,14 +109,10 @@ class LJPRetriever:
         target_fact: str,
     ) -> np.ndarray:
         """
-        Compute weighted target embedding: elements (0.7) + fact (0.3).
+        Compute weighted target embedding: elements (weight) + fact (weight).
+        Weights are read from config (same for both indices).
         
-        Args:
-            target_elements: Extracted 7 legal elements from target case
-            target_fact: Original fact text of target case
-        
-        Returns:
-            Normalized weighted combined embedding
+        Returns normalized weighted combined embedding.
         """
         cfg = self.config["retriever"]["negative"]
         elements_weight = cfg.get("elements_weight", 0.7)
@@ -119,7 +125,6 @@ class LJPRetriever:
                 parts.append(f"{name}：{value}")
         elements_text = "\n".join(parts)
         
-        # Compute separate embeddings
         elements_emb = np.zeros(self.embedding_dim)
         if elements_text:
             elements_emb = self.embedding_model.encode([elements_text], normalize_embeddings=True)[0]
@@ -128,7 +133,6 @@ class LJPRetriever:
         if target_fact and target_fact.strip():
             fact_emb = self.embedding_model.encode([target_fact], normalize_embeddings=True)[0]
         
-        # Weighted combination and normalization
         combined = elements_weight * elements_emb + fact_weight * fact_emb
         norm = np.linalg.norm(combined)
         if norm > 1e-8:
@@ -136,54 +140,63 @@ class LJPRetriever:
         
         return combined
     
-    def _cosine_search(self, target_emb: np.ndarray, top_k: int) -> List[Tuple[int, float]]:
-        """
-        Fast cosine similarity search against precomputed embeddings.
-        All embeddings are normalized, so cosine similarity equals dot product.
-        
-        Args:
-            target_emb: Target embedding (normalized)
-            top_k: Number of top results to return
-        
-        Returns:
-            List of (index, similarity_score) sorted by descending similarity
-        """
-        similarities = np.dot(self.neg_l1_embeddings, target_emb)
+    def _cosine_search(self, embeddings: np.ndarray, target_emb: np.ndarray, top_k: int) -> List[Tuple[int, float]]:
+        """Cosine similarity search against given embeddings."""
+        similarities = np.dot(embeddings, target_emb)
         top_indices = similarities.argsort()[-top_k:][::-1]
         top_similarities = similarities[top_indices]
         return list(zip(top_indices, top_similarities))
     
-    def retrieve_negative(
+    def retrieve(
         self,
         target_fact: str,
         target_elements: Dict[str, Any],
         top_k: int,
+        index_type: str = "negative",  # 'negative' or 'positive'
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve top-k similar negative error cases for target case.
-        Caller must extract elements first using LegalElementExtractor (independent tool).
+        Retrieve top-k similar cases from specified index.
         
         Args:
-            target_fact: Original fact text of target case
-            target_elements: Extracted legal elements from target case
-            top_k: Fixed number of results to return
+            target_fact: Original fact text
+            target_elements: Extracted legal elements
+            top_k: Number of results
+            index_type: 'negative' or 'positive'
         
         Returns:
-            List of retrieved negative cases with full L0-L3 layers and similarity score
+            List of retrieved cases with similarity score
         """
-        target_emb = self._compute_target_embedding(target_elements, target_fact)
-        top_results = self._cosine_search(target_emb, top_k)
+        if index_type == "negative":
+            cases = self.neg_cases
+            embeddings = self.neg_embeddings
+        elif index_type == "positive":
+            cases = self.pos_cases
+            embeddings = self.pos_embeddings
+        else:
+            raise ValueError(f"Invalid index_type: {index_type}. Must be 'negative' or 'positive'.")
         
-        # Prepare output with full case data
+        target_emb = self._compute_target_embedding(target_elements, target_fact)
+        top_results = self._cosine_search(embeddings, target_emb, top_k)
+        
         output = []
         for idx, sim in top_results:
             output.append({
-                **self.neg_cases[idx],
+                **cases[idx],
                 "similarity": float(sim),
             })
         
-        logger.info(f"Retrieved {len(output)} negative cases, max similarity: {output[0]['similarity']:.3f}")
+        if output:
+            logger.info(f"Retrieved {len(output)} {index_type} cases, max similarity: {output[0]['similarity']:.3f}")
+        else:
+            logger.info(f"No {index_type} cases retrieved")
         return output
+    
+    # Convenience methods with fixed index_type
+    def retrieve_negative(self, target_fact: str, target_elements: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
+        return self.retrieve(target_fact, target_elements, top_k, index_type="negative")
+    
+    def retrieve_positive(self, target_fact: str, target_elements: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
+        return self.retrieve(target_fact, target_elements, top_k, index_type="positive")
 
 
 def main():
@@ -203,8 +216,7 @@ def main():
             index_root=args.index_root,
             device=args.device,
         )
-        logger.info("✅ Retriever initialized successfully")
-        logger.info(f"Negative cases loaded: {len(retriever.neg_cases)}")
+        logger.info("✅ Retriever initialized successfully (both negative and positive indices loaded)")
     except Exception as e:
         logger.error(f"❌ Failed to initialize retriever: {e}")
         exit(1)

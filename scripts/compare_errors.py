@@ -4,7 +4,7 @@ Compare error cases between baseline and RAG results.
 Assumes same test set order (index alignment) and same seed.
 
 Usage:
-  python scripts/compare_errors.py --baseline results/baseline_results.json --rag results/rag_negative_top3_results.json --output-dir results/compare_analysis
+  python scripts/compare_errors.py --baseline results/baseline_results.json --rag results/rag_neg_top3_results.json --output-dir results/compare_analysis
 """
 
 import argparse
