@@ -1,8 +1,8 @@
 # Configuration for negative knowledge base construction
 
 collection:
-  # Number of error cases to collect per charge
-  per_charge: 3
+  # Number of error cases per type per charge (charge_error / article_error / term_error)
+  per_type: 1
   # Output path for collected raw error cases (L0 layer)
   output: "data/negative_error_cases/collected_errors.json"
   # Number of parallel API workers

@@ -127,8 +127,8 @@ def main():
     # Compute embeddings (normalize for cosine similarity retrieval)
     l1_embeddings = model.encode(l1_texts, normalize_embeddings=True, show_progress_bar=True)
     
-    # Save outputs
-    prefix = "neg"
+    # Save outputs with unified prefix (single KB, no more neg/pos split)
+    prefix = "unified"
     cases_path = os.path.join(args.output_dir, f"{prefix}_hierarchical_cases.json")
     embeddings_path = os.path.join(args.output_dir, f"{prefix}_l1_embeddings.npy")
     
@@ -146,14 +146,14 @@ def main():
         "num_cases": len(output_cases),
         "embedding_dim": dim,
         "retrieval_rule": "Only L1 legal elements layer is embedded for retrieval. Target query combines extracted elements + original fact with weight",
-        "elements_weight": config["retriever"]["negative"].get("elements_weight", 0.7),
-        "fact_weight": config["retriever"]["negative"].get("fact_weight", 0.3),
+        "elements_weight": config["retriever"].get("elements_weight", 0.7),
+        "fact_weight": config["retriever"].get("fact_weight", 0.3),
     })
     meta_path = os.path.join(args.output_dir, f"{prefix}_metadata.json")
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta_output, f, ensure_ascii=False, indent=2)
-    
-    logger.info(f"Saved negative index to {args.output_dir}:")
+
+    logger.info(f"Saved unified index to {args.output_dir}:")
     logger.info(f"  Full cases (all layers): {cases_path}")
     logger.info(f"  L1 embeddings (for retrieval): {embeddings_path} shape: {l1_embeddings.shape}")
     logger.info(f"  Metadata: {meta_path}")

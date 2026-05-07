@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-Retriever implementation for LJP-RAG negative/positive example retrieval.
-Supports:
-- Negative KB: L1 layer (fact elements) is embedded, weighted combination with original fact.
-- Positive KB: same embedding strategy.
+Retriever implementation for LJP-RAG unified historical case retrieval.
+Loads a single index (unified KB) with L1 legal elements embedding.
 
 Usage:
     from retriever import LJPRetriever
     retriever = LJPRetriever(config_path="config.yaml")
-    neg_results = retriever.retrieve(target_fact, target_elements, top_k=3, index_type='negative')
-    pos_results = retriever.retrieve(target_fact, target_elements, top_k=3, index_type='positive')
-    # or using convenience methods
-    neg_results = retriever.retrieve_negative(target_fact, target_elements, top_k=3)
-    pos_results = retriever.retrieve_positive(target_fact, target_elements, top_k=3)
+    results = retriever.retrieve(target_fact, target_elements, top_k=3)
 """
 
 import json
@@ -29,13 +23,13 @@ logger = logging.getLogger(__name__)
 CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent.parent
 
+
 class LJPRetriever:
     """
-    Retriever for LJP-RAG knowledge base.
-    Supports both negative (error cases) and positive (correct cases) retrieval.
-    Loads both indices at initialization.
+    Retriever for LJP-RAG unified historical case knowledge base.
+    Loads a single index (unified KB with both correct + error analysis).
     """
-    
+
     def __init__(
         self,
         config_path: str = None,
@@ -43,66 +37,39 @@ class LJPRetriever:
         embedding_model: Optional[str] = None,
         device: str = "cpu",
     ):
-        """
-        Initialize retriever. Loads both negative and positive indices.
-        
-        Args:
-            config_path: Path to config YAML file
-            index_root: Override index root directory
-            embedding_model: Override embedding model name
-            device: Device to run embedding model on
-        """
         if config_path is None:
             config_path = ROOT_DIR / "config" / "config.yaml"
 
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
-        
+
         self.index_root = index_root or self.config["retriever"]["index_root"]
-        self._load_indices()
-        
-        # Initialize embedding model
+        self._load_index()
+
         model_name = embedding_model or self.config["index"]["embedding_model"]
         logger.info(f"Loading embedding model: {model_name} on {device}")
         self.embedding_model = SentenceTransformer(model_name, device=device)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
         logger.info(f"Embedding model loaded, dimension: {self.embedding_dim}")
-    
-    def _load_indices(self) -> None:
-        """Load both negative and positive indices from disk."""
-        # Negative index
-        neg_cases_file = os.path.join(self.index_root, "neg_hierarchical_cases.json")
-        neg_embeddings_file = os.path.join(self.index_root, "neg_l1_embeddings.npy")
-        neg_meta_file = os.path.join(self.index_root, "neg_metadata.json")
-        
-        for path in [neg_cases_file, neg_embeddings_file, neg_meta_file]:
+
+    def _load_index(self) -> None:
+        """Load the unified index from disk."""
+        cases_file = os.path.join(self.index_root, "unified_hierarchical_cases.json")
+        embeddings_file = os.path.join(self.index_root, "unified_l1_embeddings.npy")
+        meta_file = os.path.join(self.index_root, "unified_metadata.json")
+
+        for path in [cases_file, embeddings_file, meta_file]:
             if not os.path.exists(path):
-                raise FileNotFoundError(f"Negative index file not found: {path}")
-        
-        with open(neg_meta_file, 'r', encoding='utf-8') as f:
-            self.neg_metadata = json.load(f)
-        with open(neg_cases_file, 'r', encoding='utf-8') as f:
-            self.neg_cases = json.load(f)
-        self.neg_embeddings = np.load(neg_embeddings_file)
-        
-        # Positive index
-        pos_cases_file = os.path.join(self.index_root, "pos_hierarchical_cases.json")
-        pos_embeddings_file = os.path.join(self.index_root, "pos_l1_embeddings.npy")
-        pos_meta_file = os.path.join(self.index_root, "pos_metadata.json")
-        
-        for path in [pos_cases_file, pos_embeddings_file, pos_meta_file]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Positive index file not found: {path}")
-        
-        with open(pos_meta_file, 'r', encoding='utf-8') as f:
-            self.pos_metadata = json.load(f)
-        with open(pos_cases_file, 'r', encoding='utf-8') as f:
-            self.pos_cases = json.load(f)
-        self.pos_embeddings = np.load(pos_embeddings_file)
-        
-        logger.info(f"Loaded negative index: {len(self.neg_cases)} cases, embeddings shape {self.neg_embeddings.shape}")
-        logger.info(f"Loaded positive index: {len(self.pos_cases)} cases, embeddings shape {self.pos_embeddings.shape}")
-    
+                raise FileNotFoundError(f"Unified index file not found: {path}")
+
+        with open(meta_file, 'r', encoding='utf-8') as f:
+            self.metadata = json.load(f)
+        with open(cases_file, 'r', encoding='utf-8') as f:
+            self.cases = json.load(f)
+        self.embeddings = np.load(embeddings_file)
+
+        logger.info(f"Loaded unified index: {len(self.cases)} cases, embeddings shape {self.embeddings.shape}")
+
     def _compute_target_embedding(
         self,
         target_elements: Dict[str, Any],
@@ -110,115 +77,94 @@ class LJPRetriever:
     ) -> np.ndarray:
         """
         Compute weighted target embedding: elements (weight) + fact (weight).
-        Weights are read from config (same for both indices).
-        
-        Returns normalized weighted combined embedding.
+        Weights are read from config.
         """
-        cfg = self.config["retriever"]["negative"]
+        cfg = self.config["retriever"]
         elements_weight = cfg.get("elements_weight", 0.7)
         fact_weight = cfg.get("fact_weight", 0.3)
-        
-        # Format elements text consistently with index building
+
         parts = []
         for name, value in target_elements.items():
             if value and str(value).strip():
                 parts.append(f"{name}：{value}")
         elements_text = "\n".join(parts)
-        
+
         elements_emb = np.zeros(self.embedding_dim)
         if elements_text:
             elements_emb = self.embedding_model.encode([elements_text], normalize_embeddings=True)[0]
-        
+
         fact_emb = np.zeros(self.embedding_dim)
         if target_fact and target_fact.strip():
             fact_emb = self.embedding_model.encode([target_fact], normalize_embeddings=True)[0]
-        
+
         combined = elements_weight * elements_emb + fact_weight * fact_emb
         norm = np.linalg.norm(combined)
         if norm > 1e-8:
             combined = combined / norm
-        
+
         return combined
-    
+
     def _cosine_search(self, embeddings: np.ndarray, target_emb: np.ndarray, top_k: int) -> List[Tuple[int, float]]:
-        """Cosine similarity search against given embeddings."""
+        """Cosine similarity search."""
         similarities = np.dot(embeddings, target_emb)
         top_indices = similarities.argsort()[-top_k:][::-1]
         top_similarities = similarities[top_indices]
         return list(zip(top_indices, top_similarities))
-    
+
     def retrieve(
         self,
         target_fact: str,
         target_elements: Dict[str, Any],
         top_k: int,
-        index_type: str = "negative",  # 'negative' or 'positive'
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve top-k similar cases from specified index.
-        
+        Retrieve top-k similar cases from the unified index.
+
         Args:
             target_fact: Original fact text
             target_elements: Extracted legal elements
             top_k: Number of results
-            index_type: 'negative' or 'positive'
-        
+
         Returns:
             List of retrieved cases with similarity score
         """
-        if index_type == "negative":
-            cases = self.neg_cases
-            embeddings = self.neg_embeddings
-        elif index_type == "positive":
-            cases = self.pos_cases
-            embeddings = self.pos_embeddings
-        else:
-            raise ValueError(f"Invalid index_type: {index_type}. Must be 'negative' or 'positive'.")
-        
         target_emb = self._compute_target_embedding(target_elements, target_fact)
-        top_results = self._cosine_search(embeddings, target_emb, top_k)
-        
+        top_results = self._cosine_search(self.embeddings, target_emb, top_k)
+
         output = []
         for idx, sim in top_results:
             output.append({
-                **cases[idx],
+                **self.cases[idx],
                 "similarity": float(sim),
             })
-        
+
         if output:
-            logger.info(f"Retrieved {len(output)} {index_type} cases, max similarity: {output[0]['similarity']:.3f}")
+            logger.info(f"Retrieved {len(output)} cases, max similarity: {output[0]['similarity']:.3f}")
         else:
-            logger.info(f"No {index_type} cases retrieved")
+            logger.info("No cases retrieved")
         return output
-    
-    # Convenience methods with fixed index_type
-    def retrieve_negative(self, target_fact: str, target_elements: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
-        return self.retrieve(target_fact, target_elements, top_k, index_type="negative")
-    
-    def retrieve_positive(self, target_fact: str, target_elements: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
-        return self.retrieve(target_fact, target_elements, top_k, index_type="positive")
 
 
 def main():
     """Quick test for retriever initialization."""
     import argparse
     logging.basicConfig(level=logging.INFO)
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=ROOT_DIR / "config" / "config.yaml", help="Config file path")
     parser.add_argument("--index-root", help="Index root directory")
     parser.add_argument("--device", default="cpu", help="Device")
     args = parser.parse_args()
-    
+
     try:
         retriever = LJPRetriever(
             config_path=args.config,
             index_root=args.index_root,
             device=args.device,
         )
-        logger.info("✅ Retriever initialized successfully (both negative and positive indices loaded)")
+        logger.info("Retriever initialized successfully (unified index)")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize retriever: {e}")
+        logger.error(f"Failed to initialize retriever: {e}")
         exit(1)
 
 
