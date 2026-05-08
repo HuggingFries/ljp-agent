@@ -8,7 +8,7 @@ Usage:
 
 Options:
   --config CONFIG       Config file path (default: config/config.yaml)
-  --input PATH          Input hierarchical error cases json (default: data/negative_error_cases/collected_errors_hierarchical_multi.json)
+  --input PATH          Input hierarchical error cases json (default: data/negative_error_cases/collected_errors_hierarchical.json)
   --output-dir DIR      Output index directory (default: data/index_hierarchical)
   --embedding-model NAME Embedding model name (overrides config.index.embedding_model)
   --device DEVICE       Device to run embedding (default: cpu)
@@ -39,7 +39,7 @@ ROOT_DIR = CURRENT_DIR.parent
 def main():
     parser = argparse.ArgumentParser(description='Build embedding index for hierarchical negative KB')
     parser.add_argument("--config", default=str(ROOT_DIR / "config/config.yaml"), help="Config file path (YAML)")
-    parser.add_argument("--input", default=str(ROOT_DIR / "data/negative_error_cases/collected_errors_hierarchical_multi.json"), help="Input hierarchical error cases json")
+    parser.add_argument("--input", default=str(ROOT_DIR / "data/negative_error_cases/collected_errors_hierarchical.json"), help="Input hierarchical error cases json")
     parser.add_argument("--output-dir", default=str(ROOT_DIR / "data/index_hierarchical"), help="Output index directory")
     parser.add_argument("--embedding-model", help="Embedding model name (overrides config)")
     parser.add_argument("--device", default="cpu", help="Device to run embedding")

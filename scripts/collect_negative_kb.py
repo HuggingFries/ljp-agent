@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml
 from openai import OpenAI
 from src.agent.charge_matcher import ChargeMatcher
+from src.agent.article_matcher import ArticleMatcher
 
 # Try to import tqdm for progress bar
 try:
@@ -48,6 +49,15 @@ CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent
 
 ERROR_TYPES = ["charge_error", "article_error", "term_error"]
+
+
+def is_charge_done(cnt: Dict[str, int], n: int, max_per_charge: int) -> bool:
+    """Check if a charge is fully collected: all error types filled OR total >= max_per_charge."""
+    if not cnt:
+        return False
+    has_all_types = all(cnt.get(etype, 0) >= n for etype in ERROR_TYPES)
+    total = sum(cnt.get(etype, 0) for etype in ERROR_TYPES)
+    return has_all_types or total >= max_per_charge
 
 
 def clean_charge(charge: str) -> str:
@@ -103,33 +113,31 @@ def bare_llm_predict(
     client: OpenAI,
     model_name: str,
     fact: str,
-    article_names: List[str],
 ) -> Tuple[List[str], List[str], Dict, str, int, int]:
-    """Direct prediction with vanilla LLM, no RAG. Predicts charges, articles, and term."""
+    """Direct prediction with vanilla LLM, no RAG."""
     prompt = f"""你是一个专业的法律AI助手，擅长中国刑事案件判决预测。
-
-## 可选法条编号（必须从这里选择，不能自己编造）
-{', '.join(article_names)}
 
 ## 目标案件事实
 {fact}
 
 ## 任务
-请预测本案的罪名、法条和刑期，**详细写出你做出该预测的推理过程**，输出格式为JSON。
+请预测本案的罪名、法条、刑期和罚金，**详细写出你做出该预测的推理过程**，输出格式为JSON。
 
 注意：
 - 输出标准的中国刑法罪名名称，不要编造罪名。直接输出罪名名称，不要加"罪"字后缀（例如："故意伤害" 不是 "故意伤害罪"）
-- 法条必须从可选法条编号中选择，只输出编号即可
 - 如果有多个罪名或法条，输出多个
 - **reasoning字段必须详细写出你为什么这么判，结合案件事实和法律规定说明推理步骤**
 - **刑期预测**：如果是有期徒刑，imprisonment输出月份数（如3年输出36）；如果是无期徒刑，life_imprisonment设为true；如果是死刑，death_penalty设为true。
+- **罚金预测**：如果判处罚金，输出罚金金额（整数）；若不需判处罚金，填0。
+- 注意：**罚金和刑期要同时考虑**。如果无需服刑（如单处罚金），刑期填0，罚金填具体金额。
 
 输出格式：
 {{
   "reasoning": "你的完整推理过程，详细说明为什么选择这些罪名、法条和刑期",
   "predicted_charges": ["罪名1", "罪名2"],
   "predicted_articles": ["法条编号"],
-  "predicted_term": {{"imprisonment": 36, "death_penalty": false, "life_imprisonment": false}}
+  "predicted_term": {{"imprisonment": 36, "death_penalty": false, "life_imprisonment": false}},
+  "predicted_fine": 10000
 }}
 """
 
@@ -154,14 +162,16 @@ def bare_llm_predict(
         predicted_articles = result.get("predicted_articles", [])
         pred_reasoning = result.get("reasoning", content)
         predicted_term = result.get("predicted_term", {})
+        predicted_fine = result.get("predicted_fine", 0)
     except Exception as e:
         logger.warning(f"JSON parsing failed, using raw output as reasoning: {e}")
         predicted_charges = []
         predicted_articles = []
         pred_reasoning = content
         predicted_term = {}
+        predicted_fine = 0
 
-    return predicted_charges, predicted_articles, predicted_term, pred_reasoning, usage.prompt_tokens, usage.completion_tokens
+    return predicted_charges, predicted_articles, predicted_term, pred_reasoning, predicted_fine, usage.prompt_tokens, usage.completion_tokens
 
 
 def load_cail2018(file_path: str) -> List[dict]:
@@ -180,11 +190,12 @@ def filter_remaining_cases(
     data: List[dict],
     charge_count: Dict[str, Dict[str, int]],
     n: int,
+    max_per_charge: int,
 ) -> List[dict]:
     """
-    Filter dataset: keep only cases containing at least one charge with an
-    unfilled error-type slot. Once a charge has all error types at target,
-    all cases with this charge are removed from the pool.
+    Filter dataset: keep only cases containing at least one charge that is not yet
+    fully collected. A charge is done when all error types reach target n OR
+    total collected cases for that charge reaches max_per_charge.
     """
     filtered = []
     for item in data:
@@ -192,9 +203,9 @@ def filter_remaining_cases(
         if not charges and 'meta' in item:
             charges = item['meta'].get('accusation', [])
         true_charges = list(map(clean_charge, charges))
-        # Keep case if any charge still needs any error type
+        # Keep case if any charge is not yet done
         for c in true_charges:
-            if any(charge_count.get(c, {}).get(etype, 0) < n for etype in ERROR_TYPES):
+            if not is_charge_done(charge_count.get(c, {}), n, max_per_charge):
                 filtered.append(item)
                 break
     logger.info(f"Data filtered: {len(filtered)}/{len(data)} cases remaining to process")
@@ -206,9 +217,10 @@ def process_single_case(
     client: OpenAI,
     model_name: str,
     charge_matcher: ChargeMatcher,
-    article_names: List[str],
+    article_matcher: ArticleMatcher,
     charge_count: Dict[str, Dict[str, int]],
     n: int,
+    max_per_charge: int,
 ) -> Dict[str, Any]:
     """
     Process single case in parallel: predict and classify error type.
@@ -246,21 +258,62 @@ def process_single_case(
     if not fact or not true_charges:
         return None
 
-    # Pre-check: skip if all charges have all error types filled
+    # Pre-check: skip if all charges are done (all types filled or maxed out)
     if all(
-        all(charge_count.get(c, {}).get(etype, 0) >= n for etype in ERROR_TYPES)
+        is_charge_done(charge_count.get(c, {}), n, max_per_charge)
         for c in true_charges
     ):
         return None
 
+    # Extract ground truth fine
+    true_fine = meta.get('punish_of_money', 0)
+
     # Vanilla LLM prediction
     try:
-        pred_charges_list, pred_articles_list, predicted_term, pred_reasoning, prompt_tokens, completion_tokens = bare_llm_predict(
+        pred_charges_list, pred_articles_list, predicted_term, pred_reasoning, predicted_fine, prompt_tokens, completion_tokens = bare_llm_predict(
             client,
             model_name,
             fact,
-            article_names,
         )
+
+        # ---- Article validation feedback loop ----
+        valid_articles, invalid_articles = article_matcher.validate(pred_articles_list)
+        attempt = 0
+        while invalid_articles and attempt < article_matcher.max_iterations:
+            attempt += 1
+            logger.info(f"Article correction attempt {attempt}: invalid={invalid_articles}")
+            feedback = (
+                f"你预测的罪名是：{'、'.join(pred_charges_list)}。\n"
+                f"以下法条编号不在可选范围内：{'、'.join(invalid_articles)}。\n"
+                f"可选法条编号：{article_matcher.valid_list_text}\n"
+                f"请根据你预测的罪名重新选择合适的法条编号，仅输出修正后的JSON：\n"
+                f'{{"法条": ["编号1", "编号2"]}}'
+            )
+            correction_prompt = feedback
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": correction_prompt}],
+                temperature=0.0,
+            )
+            prompt_tokens += resp.usage.prompt_tokens
+            completion_tokens += resp.usage.completion_tokens
+            correction = resp.choices[0].message.content.strip()
+            try:
+                correction = correction.removeprefix("```json").removesuffix("```").strip()
+                corr_data = json.loads(correction)
+                corr_articles = corr_data.get("法条", [])
+                if isinstance(corr_articles, str):
+                    corr_articles = [corr_articles]
+                valid_articles, invalid_articles = article_matcher.validate(corr_articles)
+                if valid_articles:
+                    pred_articles_list = valid_articles
+            except json.JSONDecodeError:
+                logger.warning(f"Article correction parse failed: {correction}")
+                break
+
+        if invalid_articles:
+            logger.warning(f"Articles still invalid after {attempt} corrections: {invalid_articles}")
+        pred_articles_list = valid_articles or pred_articles_list
 
         # ---- Inline data quality check ----
         pred_reasoning_stripped = (pred_reasoning or "").strip()
@@ -299,6 +352,8 @@ def process_single_case(
             "predicted_articles": list(pred_articles),
             "true_term": true_term,
             "predicted_term": predicted_term,
+            "true_fine": true_fine,
+            "predicted_fine": predicted_fine,
             "pred_reasoning": pred_reasoning,
             "predict_prompt_tokens": prompt_tokens,
             "predict_completion_tokens": completion_tokens,
@@ -317,16 +372,19 @@ def collect_error_cases(
     model_name: str,
     train_data: List[dict],
     charge_matcher: ChargeMatcher,
-    article_names: List[str],
+    article_matcher: ArticleMatcher,
     output_file: str,
     n: int = 1,
     max_workers: int = 10,
     resume_from: str = None,
+    max_per_charge: int = 10,
 ) -> None:
     """
     Main collection function: find prediction errors and save them.
     Stratified collection: per charge, collect n errors of each type
     (charge_error, article_error, term_error) = 3n total per charge.
+    If a charge has max_per_charge total cases without filling all error types,
+    it is treated as done and remaining cases for that charge are pruned.
     """
     # ========== Initialize: fresh or resume ==========
     error_cases = []
@@ -356,14 +414,15 @@ def collect_error_cases(
 
     total_charges = len(charge_count)
     logger.info(f"Target: {n} per error type x 3 types = {n * 3} total per charge, {total_charges} total charges")
+    logger.info(f"Max per charge: {max_per_charge} (charge pruned if total collected >= {max_per_charge} even if some types missing)")
     logger.info(f"Parallel workers: {max_workers}")
 
-    remaining_data = filter_remaining_cases(train_data, charge_count, n)
+    remaining_data = filter_remaining_cases(train_data, charge_count, n, max_per_charge)
     random.shuffle(remaining_data)
 
     def all_charges_done():
         return all(
-            all(cnt[etype] >= n for etype in ERROR_TYPES)
+            is_charge_done(cnt, n, max_per_charge)
             for cnt in charge_count.values()
         )
 
@@ -375,7 +434,7 @@ def collect_error_cases(
     idx = 0
     pruned_charges = {
         c for c, cnt in charge_count.items()
-        if all(cnt[etype] >= n for etype in ERROR_TYPES)
+        if is_charge_done(cnt, n, max_per_charge)
     }
 
     if has_tqdm:
@@ -399,13 +458,13 @@ def collect_error_cases(
                 idx += 1
                 true_charges = get_true_charges_list(item)
                 if all(
-                    all(charge_count.get(c, {}).get(etype, 0) >= n for etype in ERROR_TYPES)
+                    is_charge_done(charge_count.get(c, {}), n, max_per_charge)
                     for c in true_charges
                 ):
                     continue
                 future = executor.submit(
                     process_single_case, item, client, model_name,
-                    charge_matcher, article_names, charge_count, n,
+                    charge_matcher, article_matcher, charge_count, n, max_per_charge,
                 )
                 futures[future] = item
 
@@ -451,6 +510,8 @@ def collect_error_cases(
                         "predicted_articles": result["predicted_articles"],
                         "true_term": result.get("true_term", {}),
                         "predicted_term": result.get("predicted_term", {}),
+                        "true_fine": result.get("true_fine", 0),
+                        "predicted_fine": result.get("predicted_fine", 0),
                         "pred_reasoning": result["pred_reasoning"],
                         "predict_prompt_tokens": result["predict_prompt_tokens"],
                         "predict_completion_tokens": result["predict_completion_tokens"],
@@ -474,6 +535,7 @@ def collect_error_cases(
                                 "per_type_target": n,
                                 "charge_count": charge_count,
                                 "max_workers": max_workers,
+                                "max_per_charge": max_per_charge,
                                 "resumed_from": resume_from,
                             },
                             "count": len(error_cases),
@@ -489,17 +551,23 @@ def collect_error_cases(
                     )
                     logger.info(f"Saved ({type_counts})")
 
-                    # Prune: any charge just became fully done? remove its cases from pool
+                    # Prune: any charge just became done? remove its cases from pool
                     for c in result["true_charges"]:
                         if c in pruned_charges:
                             continue
-                        if all(charge_count[c][etype] >= n for etype in ERROR_TYPES):
+                        if is_charge_done(charge_count[c], n, max_per_charge):
                             pruned_charges.add(c)
                             n_done = len(pruned_charges)
-                            logger.info(f"Charge {c} fully collected ({n_done}/{total_charges}). Pruning pool...")
+                            cnt = charge_count[c]
+                            has_all_types = all(cnt[etype] >= n for etype in ERROR_TYPES)
+                            total = sum(cnt[etype] for etype in ERROR_TYPES)
+                            if has_all_types:
+                                logger.info(f"Charge {c} fully collected ({n_done}/{total_charges}). Pruning pool...")
+                            else:
+                                logger.info(f"Charge {c} maxed out ({total} cases, missing types). Pruning pool...")
                             before = len(remaining_data)
                             if idx < len(remaining_data):
-                                remaining_data = filter_remaining_cases(remaining_data[idx:], charge_count, n)
+                                remaining_data = filter_remaining_cases(remaining_data[idx:], charge_count, n, max_per_charge)
                                 idx = 0
                                 random.shuffle(remaining_data)
                                 after = len(remaining_data)
@@ -517,7 +585,7 @@ def collect_error_cases(
 
     done_count = sum(
         1 for cnt in charge_count.values()
-        if all(cnt[etype] >= n for etype in ERROR_TYPES)
+        if is_charge_done(cnt, n, max_per_charge)
     )
 
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -531,6 +599,7 @@ def collect_error_cases(
                 "per_type_target": n,
                 "charge_count": charge_count,
                 "max_workers": max_workers,
+                "max_per_charge": max_per_charge,
                 "resumed_from": resume_from,
                 "error_rate": total_errors / total_processed if total_processed > 0 else 0,
                 "done_charges": done_count,
@@ -545,6 +614,12 @@ def collect_error_cases(
     logger.info(f"  Total cases processed: {total_processed}")
     logger.info(f"  Total error cases collected: {len(error_cases)}")
     logger.info(f"  Charges fully completed: {done_count}/{total_charges} ({n} per type)")
+    maxed = [
+        c for c, cnt in charge_count.items()
+        if is_charge_done(cnt, n, max_per_charge) and any(cnt[etype] < n for etype in ERROR_TYPES)
+    ]
+    if maxed:
+        logger.info(f"  Maxed out (hit {max_per_charge} limit, some types missing): {len(maxed)} charges")
     incomplete = [
         (c, cnt) for c, cnt in charge_count.items()
         if any(cnt[etype] < n for etype in ERROR_TYPES)
@@ -589,6 +664,7 @@ def main():
     parser.add_argument('--output', type=str, default=None, help='Output knowledge base path')
     parser.add_argument('--max-workers', type=int, default=None, help='Parallel workers, adjust by API rate limit')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
+    parser.add_argument('--max-per-charge', type=int, default=None, help='Max total cases per charge before giving up on missing error types (default: from config)')
     parser.add_argument('--resume-from', type=str, default=None, help='Resume from existing checkpoint')
     args = parser.parse_args()
     
@@ -609,6 +685,7 @@ def main():
     n = args.per_type or collect_config.get("per_type", 1)
     output = args.output or collect_config.get("output", str(ROOT_DIR / "data/negative_error_cases/collected_errors.json"))
     max_workers = args.max_workers or collect_config.get("max_workers", 10)
+    max_per_charge = args.max_per_charge or collect_config.get("max_per_charge", 10)
     seed = args.seed or collect_config.get("seed", 42)
     
     # Initialize client
@@ -626,16 +703,13 @@ def main():
     
     law_path = global_config.get("data", {}).get("law_path", "data/law.txt")
     article_path = ROOT_DIR / law_path
-    article_names = []
-    if article_path.exists():
-        with open(article_path, 'r', encoding='utf-8') as f:
-            article_names = [line.strip() for line in f if line.strip()]
-    
+
     if not charge_names:
         raise ValueError(f"Charge list not found at: {charge_path}")
     
-    # Initialize charge matcher
+    # Initialize charge matcher and article matcher
     charge_matcher = ChargeMatcher(str(charge_path))
+    article_matcher = ArticleMatcher(str(article_path))
 
     # Load training data
     train_file = args.train_file or collect_config.get("train_file", str(ROOT_DIR / "data/final_all_data/first_stage/train.json"))
@@ -653,11 +727,12 @@ def main():
         model_name,
         train_data,
         charge_matcher,
-        article_names,
+        article_matcher,
         output,
         n=n,
         max_workers=max_workers,
         resume_from=args.resume_from,
+        max_per_charge=max_per_charge,
     )
 
 
