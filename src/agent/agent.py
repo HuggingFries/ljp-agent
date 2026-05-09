@@ -80,7 +80,7 @@ class LJPRAGAgent:
         self.accu = self._load_label_file(self.accu_path)
         logger.info(f"Loaded {len(self.accu)} candidate accusations from {self.accu_path}")
         self.charge_matcher = ChargeMatcher(str(self.accu_path))
-        self.article_matcher = ArticleMatcher(str(self.law_path))
+        self.article_matcher = ArticleMatcher(str(self.law_path), charge_article_data=str(ROOT_DIR / "data/charge_article_mapping.json"))
 
         api_key = self._get_api_key()
         base_url = self.config["api"]["base_url"]
@@ -245,7 +245,7 @@ class LJPRAGAgent:
             logger.info(f"Article correction attempt {attempt}: invalid={invalid_articles}")
             feedback = (
                 f"以下法条编号不在可选范围内：{'、'.join(invalid_articles)}。\n"
-                f"可选法条编号：{self.article_matcher.valid_list_text}\n"
+                f"可选法条编号（{', '.join(pred_charges)}相关）：{self.article_matcher.get_articles_for_charges(pred_charges) if attempt == 1 else self.article_matcher.valid_list_text}\n"
                 f"请根据案件事实重新选择合适的法条编号，仅输出修正后的JSON：\n"
                 f'{{"法条": ["编号1", "编号2"]}}'
             )

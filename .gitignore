@@ -72,7 +72,15 @@ results/
 memory/
 
 # Logs
+logs/*
+!logs/.gitkeep
 *.log
+
+# Experiment tracking
+wandb/
+
+# Claude Code
+.claude/
 
 # Environment variables (secrets)
 .env

@@ -23,13 +23,13 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-print("👉 Script started, importing dependencies...")
+print("Script started, importing dependencies...")
 
 from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info("🚀 Starting build_hierarchical_index.py")
+logger.info("Starting build_hierarchical_index.py")
 
 # Project paths
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -62,22 +62,22 @@ def main():
     # Load input hierarchical error cases
     logger.info(f"Checking input file: {args.input}")
     if not os.path.exists(args.input):
-        logger.error(f"❌ Input file not found: {args.input}")
+        logger.error(f"[ERROR] Input file not found: {args.input}")
         logger.error("Did you run build_hierarchical_error_kb.py first?")
         exit(1)
     
-    logger.info(f"✅ Input file exists, size: {os.path.getsize(args.input)} bytes")
+    logger.info(f"[OK] Input file exists, size: {os.path.getsize(args.input)} bytes")
     logger.info(f"Loading input json...")
     with open(args.input, 'r', encoding='utf-8') as f:
         input_data = json.load(f)
     
-    logger.info(f"✅ JSON loaded, parsing...")
+    logger.info(f"[OK] JSON loaded, parsing...")
     if isinstance(input_data, dict) and "cases" in input_data:
         cases = input_data["cases"]
         metadata = input_data.get("metadata", {})
-        logger.info(f"✅ Found {len(cases)} cases in input")
+        logger.info(f"[OK] Found {len(cases)} cases in input")
     else:
-        logger.error("❌ Input data format error: expected dict with 'cases' key")
+        logger.error("[ERROR] Input data format error: expected dict with 'cases' key")
         exit(1)
     
     # Limit samples for testing if requested
@@ -90,15 +90,15 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     if not os.path.isdir(args.output_dir):
-        logger.error(f"❌ Failed to create output directory {args.output_dir}")
+        logger.error(f"[ERROR] Failed to create output directory {args.output_dir}")
         exit(1)
-    logger.info(f"✅ Output directory ready: {args.output_dir}")
+    logger.info(f"[OK] Output directory ready: {args.output_dir}")
     
     # Load embedding model
     logger.info(f"Loading embedding model {model_name} to {args.device}")
     model = SentenceTransformer(model_name, device=args.device)
     dim = model.get_sentence_embedding_dimension()
-    logger.info(f"✅ Model loaded, embedding dimension: {dim}")
+    logger.info(f"[OK] Model loaded, embedding dimension: {dim}")
     
     # Process negative cases: ONLY L1.legal_elements is embedded for retrieval
     l1_texts: List[str] = []
@@ -121,7 +121,7 @@ def main():
         l1_texts.append(l1_text)
         output_cases.append(item)  # Keep full structure (all layers) for output, used in prompt injection
     
-    logger.info(f"✅ Extracted L1 text for {len(output_cases)} negative cases")
+    logger.info(f"[OK] Extracted L1 text for {len(output_cases)} negative cases")
     logger.info(f"Generating embeddings for L1 layer only... (this may take a few minutes)")
     
     # Compute embeddings (normalize for cosine similarity retrieval)
@@ -158,7 +158,7 @@ def main():
     logger.info(f"  L1 embeddings (for retrieval): {embeddings_path} shape: {l1_embeddings.shape}")
     logger.info(f"  Metadata: {meta_path}")
     
-    logger.info("\n✅ Done! Negative index built successfully.")
+    logger.info("\nDone! Negative index built successfully.")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,17 @@ Now includes sentence (term + fine) evaluation.
 
 Usage:
   python test_with_wandb.py [options]
+Options:
+  --config CONFIG_PATH       Path to YAML config file (default: config/config.yaml)
+  --test-file TEST_FILE      Path to test JSONL file (overrides config)
+  --max-samples MAX_SAMPLES Limit number of test samples to process
+  --device DEVICE            Device for embedding model (default: cpu)
+  --project PROJECT_NAME     Wandb project name (default: ljp-agent)
+  --output-dir OUTPUT_DIR    Directory to save results (default: results/)
+  --max-workers MAX_WORKERS  Maximum concurrent workers for processing (default: 10)
+  --run-baseline             Run baseline experiment only
+  --run-agent                Run RAG agent experiment only
+  --run-all                  Run both baseline and RAG agent (default if none selected)
 """
 
 import json
@@ -256,7 +267,7 @@ def evaluate_model(
                     total_article_samples += 1
                     if res["article_correct"]:
                         article_correct += 1
-                if res["charge_correct"] and (not res["has_article"] or res["article_correct"]):
+                if res["charge_correct"] and (not res["has_article"] or res["article_correct"]) and res["term_correct"]:
                     joint_correct += 1
                 if res["term_correct"]:
                     term_correct += 1
