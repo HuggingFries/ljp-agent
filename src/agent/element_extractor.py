@@ -64,7 +64,7 @@ class LegalElementExtractor:
         Args:
             config_path: 配置文件路径，读取API配置
         """
-        if config_path is not None:
+        if config_path is None:
             config_path = ROOT_DIR / "config" / "config.yaml"
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)

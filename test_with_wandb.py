@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated wandb experiments: compare baseline vs RAG unified historical case enhancement.
-Now includes sentence (term + fine) evaluation.
+Automated wandb experiments: compare baseline vs RAG (error-reason based historical cases).
 
 Usage:
   python test_with_wandb.py [options]
@@ -55,6 +54,7 @@ def parse_args():
     parser.add_argument("--run-baseline", action="store_true", help="Run baseline experiment only")
     parser.add_argument("--run-agent", action="store_true", help="Run RAG agent experiment only")
     parser.add_argument("--run-all", action="store_true", help="Run both baseline and agent (default if none selected)")
+    parser.add_argument("--top-k", type=int, help="Number of cases to retrieve (overrides config)")
     args = parser.parse_args()
 
     if not (args.run_baseline or args.run_agent):
@@ -159,12 +159,13 @@ def process_single_sample(
     idx: int,
     sample: Dict[str, Any],
     model,
+    top_k: int = 3,
 ) -> Dict[str, Any]:
     fact = sample.get("fact", "")
     true_charges, true_articles, true_term, true_fine = extract_ground_truth(sample)
 
     try:
-        result = model.predict(fact)
+        result = model.predict(fact, top_k=top_k)
         pred_charges = result.get("pred_charges", [])
         pred_articles = result.get("pred_articles", [])
         pred_term = result.get("pred_term", {})
@@ -235,6 +236,7 @@ def evaluate_model(
     max_workers: int,
     output_dir: str,
     experiment_name: str,
+    top_k: int = 3,
 ) -> Dict[str, Any]:
     total_samples = len(test_data)
     charge_correct = 0
@@ -254,7 +256,7 @@ def evaluate_model(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(process_single_sample, idx, sample, model): idx
+            executor.submit(process_single_sample, idx, sample, model, top_k): idx
             for idx, sample in enumerate(test_data)
         }
         for future in as_completed(futures):
@@ -368,7 +370,7 @@ def run_rag(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
         test_data = test_data[:args.max_samples]
 
     model = LJPRAGAgent(config_path=args.config, device=args.device)
-    top_k = config.get("retriever", {}).get("top_k", 3)
+    top_k = args.top_k if args.top_k is not None else config.get("retriever", {}).get("top_k", 3)
     experiment_name = f"rag_top{top_k}"
 
     metrics = evaluate_model(
@@ -377,9 +379,11 @@ def run_rag(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
         max_workers=args.max_workers,
         output_dir=args.output_dir,
         experiment_name=experiment_name,
+        top_k=top_k,
     )
 
-    with wandb.init(project=args.project, name=experiment_name) as run:
+    wandb_name = f"rag_top{top_k}"
+    with wandb.init(project=args.project, name=wandb_name) as run:
         log_dict = {
             "final_charge_acc": metrics["charge_accuracy"],
             "final_article_acc": metrics["article_accuracy"],
@@ -396,7 +400,8 @@ def run_rag(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
             log_dict["final_fine_mae"] = metrics["avg_fine_mae"]
         wandb.log(log_dict)
 
-        artifact = wandb.Artifact(f"rag_predictions_top{top_k}", type="predictions")
+        artifact_name = f"rag_predictions_top{top_k}"
+        artifact = wandb.Artifact(artifact_name, type="predictions")
         artifact.add_file(metrics["output_path"])
         run.log_artifact(artifact)
 

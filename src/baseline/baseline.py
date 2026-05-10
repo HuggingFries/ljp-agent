@@ -96,7 +96,7 @@ class LJPBaseline:
             )
         return key
 
-    def predict(self, fact: str) -> Dict[str, Any]:
+    def predict(self, fact: str, **kwargs) -> Dict[str, Any]:
         """
         Run baseline prediction directly from raw fact.
         Predicts charges, articles, term, and fine.

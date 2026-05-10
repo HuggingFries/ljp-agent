@@ -63,10 +63,9 @@
 ## 项目：LJP-RAG 统一历史案例增强
 
 ### 项目目标
-构建基于**统一历史案例知识库**的RAG系统，每个案例包含：
-- **正例**（正确判决案例）：从训练集选取的典型罪名正确判决
-- **错例**（错误分析案例）：LLM曾预测错误的案例，含规则（rule）、涵摄（reasoning）、易错点（error_reason）三维分析
-帮助LLM参考历史案例进行三任务联合预测（罪名+法条+刑期+罚金）。
+构建基于**错误案例知识库**的RAG系统，每个案例包含：
+- **错例**：LLM曾预测错误的案例，含case_summary（事实摘要）和error_reason（易错点分析）
+- 利用模型自身历史错误来纠正当前预测，避免重蹈覆辙
 
 ### 完整工作流
 
@@ -91,19 +90,18 @@
 3. **索引构建（`build_hierarchical_index.py`）**
    - 对L1层进行Sentence-BERT嵌入，归一化后输出`unified_*`文件
    - 输出位置：`data/index_hierarchical/unified_*`
-   - 注意：当前目录只有`pos_*`/`neg_*`，需运行此脚本生成unified索引
 
-5. **检索阶段**
+4. **检索阶段**
    - 对输入案件提取七要素，加权组合（elements_weight=0.7, fact_weight=0.3）进行余弦相似度检索
-   - 从统一知识库中检索top-k最相似的历史案例
+   - 从错误案例知识库中检索top-k最相似的历史案例
 
-6. **预测阶段**
+5. **预测阶段**
    - 基线模式（baseline）：纯LLM预测，不注入历史案例
-   - Agent模式（RAG增强）：检索到的案例注入prompt，展示case_summary + rule + reasoning + error_reason
+   - Agent模式（RAG增强）：检索到的历史案例注入prompt，仅展示case_summary + error_reason
    - 两模式均通过`ChargeMatcher`映射罪名
    - Agent模式额外使用`ArticleMatcher`做法条合法性修正循环（带罪名关联法条交集筛选：首轮显示罪名交集法条，后续回退全量列表）
 
-7. **评估阶段**
+6. **评估阶段**
    - 罪名准确率：集合精确匹配
    - 法条准确率：集合精确匹配
    - 联合准确率：罪名+法条+刑期三者同时正确
@@ -118,9 +116,9 @@ L0: 原始信息层（fact, true/pred charges/articles/term/fine, pred_reasoning
 L1: 检索层（7个定性法律要素，Sentence-BERT嵌入）
 L2: 认知层：
    - `case_summary`：事实摘要
-   - `rule`：判案规则（抽象大前提）
-   - `reasoning`：涵摄分析（三段论）
-   - `error_reason`：易错点分析
+   - `error_reason`：易错点分析（结合模型实际错误，分析哪些要素导致误判）
+   - `rule`：判案规则（抽象大前提，KB中保留但注入时不使用）
+   - `reasoning`：涵摄分析（三段论，KB中保留但注入时不使用）
 L3: 当前未使用
 
 ### 项目结构
@@ -129,19 +127,17 @@ L3: 当前未使用
 test_with_wandb.py       评估脚本，支持baseline/agent，wandb记录
 test_retrieval.py        检索质量测试
 src/agent/
-  agent.py               RAG Agent：extract→retrieve→predict
+  agent.py               RAG Agent（error_reason only）：extract→retrieve→predict
   element_extractor.py   七要素提取
-  retriever.py           统一KB检索器（加权嵌入+余弦相似度）
+  retriever.py           错误案例KB检索器（加权嵌入+余弦相似度）
   charge_matcher.py      罪名映射（Sentence-BERT余弦→标准罪名名）
   article_matcher.py     法条验证+修正循环（带罪名关联法条交集筛选）
 src/baseline/
   baseline.py            纯LLM基线
 scripts/
   collect_negative_kb.py               错误收集（分层+质量过滤+断点续传）
-  build_hierarchical_error.py          L1+L2生成（要素提取+规则/推理/边界）
+  build_hierarchical_error.py          L1+L2生成（要素提取+rule/reasoning/error_reason）
   build_hierarchical_index.py          嵌入索引构建
-  analyze_charge_impact.py             辅助分析
-  compare_errors.py                    辅助对比
 config/
   config.yaml            Agent配置（api, retriever, index, data）
   kb_building.yaml       KB构建配置（collection, hierarchy_build）
@@ -152,15 +148,11 @@ data/
   index_hierarchical/    索引文件
 ```
 
-### 项目现状（2026-05-09）
-- 负例收集+构建完成：513条分层案例（L1+L2已完成）
+### 项目现状（2026-05-10）
+- 错误案例收集+构建完成：513条分层案例（L1+L2已完成）
 - 统一索引已构建：`data/index_hierarchical/unified_*`（513条，768维）
-- 三任务联合预测（罪名+法条+刑期+罚金）已实现
-- ArticleMatcher法条修正循环已集成，带罪名关联法条交集筛选（首轮交集→第二轮全量）
-- Joint准确率定义改为罪名+法条+刑期三者同时正确
-- 罪名→法条映射已预构建：`data/charge_article_mapping.json`（202罪名）
-- RAG top-2 跑分（500条）：charge=88.0%, article=85.1%, term=86.4%, joint=74.0%
-- Baseline 跑分（500条）：charge=86.0%, article=82.8%, term=85.4%, joint=73.0%
+- 仅使用error_reason注入，不再使用rule（正例）
+- 全量1000例测试：charge=90.1%, joint=77.4%, term=87.0%（优于baseline: 89.2%/75.1%/85.9%）
 
 ---
 
